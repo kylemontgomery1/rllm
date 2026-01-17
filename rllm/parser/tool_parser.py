@@ -2,6 +2,8 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
+import json5
+
 from rllm.tools.tool_base import ToolCall
 
 
@@ -266,3 +268,74 @@ For each function call, return a json object with function name and arguments wi
 {{"name": <function-name>, "arguments": <args-json-object>}}
 </tool_call>
 """.rstrip()
+
+
+class TongyiDeepResearchToolParser(QwenToolParser):
+    def parse_qwen_tool_calls(self, text: str) -> list[dict[str, Any]]:
+        """Parse tool calls from text using a simple token format.
+        Note the only difference compared to QwenToolParser is that we don't expect a trailing </tool_call>,
+        since we use </tool_call> as a stop token.
+
+        Format:
+        <tool_call>{"name": "function_name", "arguments": {...}}
+
+        Special case for PythonInterpreter:
+        <tool_call>{"name": "PythonInterpreter", "arguments": {}}
+        <code>
+        # python code here
+        </code>
+
+        Returns:
+            list[dict]: List of parsed tool calls, each containing 'name' and 'parameters'
+        """
+        tool_calls: list[dict[str, Any]] = []
+
+        if self.tool_call_begin not in text:
+            # Try to parse as JSON
+            try:
+                call_data = json5.loads(content)
+                if "name" in call_data and "arguments" in call_data:
+                    tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
+                    return tool_calls
+            except Exception:
+                pass
+
+            return tool_calls
+
+        start = text.find(self.tool_call_begin) + len(self.tool_call_begin)
+        content = text[start:].strip()
+
+        # If model outputs another <tool_call> instead of stop token, discard everything after
+        if self.tool_call_begin in content:
+            content = content.split(self.tool_call_begin)[0].strip()
+
+        # Check for PythonInterpreter with <code> block
+        if "<code>" in content:
+            # Extract JSON part (before <code>)
+            code_start = content.find("<code>")
+            json_content = content[:code_start].strip()
+
+            # Extract code content
+            code_content_start = code_start + len("<code>")
+            code_end = content.find("</code>")
+            if code_end != -1:
+                code = content[code_content_start:code_end].strip()
+            else:
+                # No closing </code> tag - take everything after <code>
+                code = content[code_content_start:].strip()
+
+            try:
+                call_data = json5.loads(json_content)
+                # Add code to arguments
+                call_data["arguments"]["code"] = code
+                tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
+            except Exception as e:
+                print(f"Error parsing PythonInterpreter tool call: {json_content}, error: {e}")
+        else:
+            try:
+                call_data = json5.loads(content)
+                tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
+            except Exception as e:
+                print(f"Error parsing tool call: {content}, error: {e}")
+
+        return tool_calls

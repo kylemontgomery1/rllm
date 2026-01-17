@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import re
@@ -100,6 +101,9 @@ class ChatTemplateParser:
                 else:
                     logger.info(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
                     return DeepseekQwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
+            elif "tongyi-deepresearch" in model_name:
+                logger.info(f"Using TongyiDeepResearchChatTemplateParser for {tokenizer.name_or_path}")
+                return TongyiDeepResearchChatTemplateParser(tokenizer)
             elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
                 logger.info(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
                 return QwenChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
@@ -625,6 +629,117 @@ class LlamaChatTemplateParser(ChatTemplateParser):
     def parse_completion(self, completion_ids):
         # TODO: add parse_completion for llama
         raise NotImplementedError("LLamaChatTemplateParser does not support parse_completion")
+
+
+class TongyiDeepResearchChatTemplateParser(QwenChatTemplateParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        print("TongyiDeepResearchChatTemplateParser init")
+        from rllm.parser.tool_parser import TongyiDeepResearchToolParser
+
+        self.tool_parser = TongyiDeepResearchToolParser()
+
+    def parse_system(self, message, tools_prompt_str=""):
+        content = message["content"]
+        if "# Tools" not in content and tools_prompt_str:
+            content += tools_prompt_str
+        if "Current date:" not in content:
+            content += "\n\nCurrent date: " + datetime.date.today().strftime("%Y-%m-%d")
+        return self.system_token + content + self.eot_token
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = (message.get("content", None) or "").strip()
+        reasoning = (message.get("reasoning", None) or "").strip()
+        tool_calls = message.get("tool_calls", None) or []
+
+        if not reasoning and not tool_calls:
+            return self.assistant_token + content + self.eot_token
+
+        else:
+            result = self.assistant_token
+
+            if reasoning and accumulate_reasoning:
+                result += "<think>\n" + reasoning
+                if content or tool_calls:
+                    result += "\n</think>\n\n"
+
+            if content:
+                result += content
+
+            elif tool_calls:
+                try:
+                    tool_calls_strs = []
+                    for tool_call in tool_calls:
+                        if isinstance(tool_call, ToolCall):
+                            tool_call_dict = tool_call.to_dict()
+                        elif isinstance(tool_call, dict) and "function" in tool_call:
+                            tool_call_dict = tool_call["function"]
+                        else:
+                            tool_call_dict = tool_call
+                        arguments_obj = tool_call_dict.get("arguments")
+                        if isinstance(arguments_obj, str):
+                            try:
+                                arguments_obj = json.loads(arguments_obj)
+                            except json.JSONDecodeError:
+                                pass
+
+                        tool_name = tool_call_dict.get("name", "")
+
+                        # Special handling for PythonInterpreter
+                        if tool_name == "PythonInterpreter" and isinstance(arguments_obj, dict) and "code" in arguments_obj:
+                            code = arguments_obj["code"]
+                            tool_call_for_dump = {"name": tool_name, "arguments": {}}
+                            tool_call_str = f"{self.tool_parser.tool_call_begin}\n{json.dumps(tool_call_for_dump)}\n<code>\n{code}\n</code>\n{self.tool_parser.tool_call_end}"
+                        else:
+                            tool_call_for_dump = dict(tool_call_dict)
+                            if arguments_obj is not None:
+                                tool_call_for_dump["arguments"] = arguments_obj
+                            tool_call_str = f"{self.tool_parser.tool_call_begin}\n{json.dumps(tool_call_for_dump)}\n{self.tool_parser.tool_call_end}"
+
+                        tool_calls_strs.append(tool_call_str)
+                    tool_calls_str = "\n".join(tool_calls_strs)
+                except Exception as e:
+                    logger.error(f"Failed to format tool calls: {e}")
+                    tool_calls_str = ""
+
+                result += tool_calls_str
+
+            result += self.eot_token
+            return result
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        if completion_text.count("</think>") == 1:
+            reasoning, _, content = completion_text.partition("</think>")
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            reasoning = reasoning.strip()
+            content = content.strip()
+        else:
+            # generation was cut short during reasoning
+            reasoning = completion_text
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            reasoning = reasoning.strip()
+            content = ""
+
+        # Parse tool calls from content
+        tool_calls = self.tool_parser.parse(content) if content else []
+
+        # For Tongyi, we assume either tool calls OR content, not both
+        if tool_calls:
+            content = ""
+
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+        }
 
 
 class HarmonyChatTemplateParser(ChatTemplateParser):

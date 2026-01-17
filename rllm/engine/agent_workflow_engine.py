@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -163,6 +165,16 @@ class AgentWorkflowEngine:
         with tqdm(total=len(tasks), desc="Generating trajectories") as pbar:
             for future in asyncio.as_completed(futures):
                 task_id, rollout_idx, episode = await future
+
+                # Save episode to JSON file
+                try:
+                    output_dir = Path("logs/asearcher-rollout")
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    episode_path = output_dir / f"{episode.id}.json"
+                    with open(episode_path, "w") as f:
+                        json.dump(episode.to_dict(), f, indent=4, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(f"Failed to save episode {episode.id}: {e}")
 
                 state = task_states[task_id]
                 state["episodes"].append(episode)

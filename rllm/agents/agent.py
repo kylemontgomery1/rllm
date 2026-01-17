@@ -1,5 +1,6 @@
 import uuid
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,12 +25,29 @@ class Step:
     done: bool = False
     mc_return: float = 0.0
 
+    def __post_init__(self):
+        self.chat_completions = deepcopy(self.chat_completions)
+        self.info = deepcopy(self.info)
+
     def to_dict(self) -> dict:
+        from rllm.tools.tool_base import ToolCall, ToolOutput
+
+        # Helper function to recursively convert ToolCall and ToolOutput objects to dicts
+        def _serialize_value(value):
+            if isinstance(value, ToolCall | ToolOutput):
+                return value.to_dict()
+            elif isinstance(value, list):
+                return [_serialize_value(item) for item in value]
+            elif isinstance(value, dict):
+                return {k: _serialize_value(v) for k, v in value.items()}
+            else:
+                return value
+
         return {
             "prompt_ids": self.prompt_ids,
             "response_ids": self.response_ids,
             "logprobs": self.logprobs,
-            "chat_completions": self.chat_completions,
+            "chat_completions": _serialize_value(self.chat_completions),
             "observation": self.observation,
             "thought": self.thought,
             "action": self.action.action if isinstance(self.action, Action) else self.action,
