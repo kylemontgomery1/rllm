@@ -2,6 +2,7 @@ import datetime
 import json
 import logging
 import re
+import os
 from copy import deepcopy
 
 import torch
@@ -930,3 +931,246 @@ class DeepSeekV32ExpChatTemplateParser(ChatTemplateParser):
             "reasoning": reasoning,
             "tool_calls": [],
         }
+
+
+class DeepResearchVChatTemplateParser:
+    def __init__(self, tokenizer, processor=None, disable_thinking=False, image_folder_path="./pageshots", resize_width=None):
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.disable_thinking = disable_thinking
+
+        self.bos_token = tokenizer.bos_token
+        self.eos_token = tokenizer.eos_token
+        self.eot_token = "<|im_end|>\n"
+        self.system_token = "<|im_start|>system\n"
+        self.user_token = "<|im_start|>user\n"
+        self.assistant_token = "<|im_start|>assistant\n"
+        if disable_thinking:
+            self.assistant_token += "<think>\n\n</think>\n\n"
+        self.generation_prompt = self.assistant_token
+        self.image_token = "<|image_pad|>"
+        self.vision_start_token = "<|vision_start|>"
+        self.vision_end_token = "<|vision_end|>"
+
+        self.patch_size = processor.image_processor.patch_size
+        self.merge_size = processor.image_processor.merge_size
+        self.patch_factor = self.patch_size * self.merge_size
+
+        self.image_folder_path = image_folder_path
+        self.resize_width = resize_width
+        
+        from rllm.parser.tool_parser import QwenToolParser
+        self.tool_parser = QwenToolParser()
+
+    def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list = None, accumulate_reasoning: bool = False, **kwargs) -> str:
+        tools = tools or []
+        tools_prompt_str = ""
+        if tools:
+            try:
+                tool_schema_strs = []
+                for tool in tools:
+                    if hasattr(tool, 'json'):
+                        tool_schema_str = json.dumps(tool.json)
+                    elif isinstance(tool, dict):
+                        tool_schema_str = json.dumps(tool)
+                    else:
+                        tool_schema_str = tool
+                    tool_schema_strs.append(tool_schema_str)
+                tools_schema_str = "\n".join(tool_schema_strs)
+                tools_prompt_str = self.tool_parser.get_tool_prompt(tools_schema_str)
+            except Exception as e:
+                print(f"Failed to format tools: {e}")
+
+        result = ""
+
+        # if the first message is not a system message, add the system message
+        if is_first_msg and messages[0]["role"] != "system":
+            result += self.system_token + "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." + tools_prompt_str + self.eot_token
+
+        for message in messages:
+            if message["role"] == "system":
+                result += self.parse_system(message, tools_prompt_str)
+            elif message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message, accumulate_reasoning=accumulate_reasoning)
+            elif message["role"] == "tool":
+                tool_outputs_str = self.parse_tool(message)
+                result += tool_outputs_str
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+
+        return result
+
+    def parse_system(self, message, tools_prompt_str=""):
+        content = message["content"]
+        if "# Tools" not in content and tools_prompt_str:
+            content += tools_prompt_str
+        if "Current date:" not in content:
+            content += "\n\nCurrent date: " + datetime.date.today().strftime("%Y-%m-%d")
+        return self.system_token + content + self.eot_token
+
+    def parse_user(self, message):
+        return self.user_token + message["content"] + self.eot_token
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = (message.get("content", None) or "").strip()
+        reasoning = (message.get("reasoning", None) or "").strip()
+        tool_calls = message.get("tool_calls", None) or []
+
+        if not reasoning and not tool_calls:
+            return self.assistant_token + content + self.eot_token
+
+        else:
+            result = self.assistant_token
+            if reasoning and accumulate_reasoning:
+                result += "<think>\n" + reasoning
+                if content or tool_calls:
+                    result += "\n</think>\n\n"
+
+            if content:
+                result += content
+
+            if tool_calls:
+                try:
+                    tool_calls_strs = []
+                    for tool_call in tool_calls:
+                        if hasattr(tool_call, 'to_dict'):
+                            tool_call_dict = tool_call.to_dict()
+                        elif isinstance(tool_call, dict) and "function" in tool_call:
+                            tool_call_dict = tool_call["function"]
+                        else:
+                            tool_call_dict = tool_call
+                        arguments_obj = tool_call_dict.get("arguments")
+                        if isinstance(arguments_obj, str):
+                            try:
+                                arguments_obj = json.loads(arguments_obj)
+                            except json.JSONDecodeError:
+                                pass
+                        tool_call_for_dump = dict(tool_call_dict)
+                        if arguments_obj is not None:
+                            tool_call_for_dump["arguments"] = arguments_obj
+                        tool_call_str = f"{self.tool_parser.tool_call_begin}\n{json.dumps(tool_call_for_dump)}\n{self.tool_parser.tool_call_end}"
+                        tool_calls_strs.append(tool_call_str)
+                    tool_calls_str = "\n".join(tool_calls_strs)
+                except Exception as e:
+                    print(f"Failed to format tool calls: {e}")
+                    tool_calls_str = ""
+
+                result += tool_calls_str
+
+            result += self.eot_token
+            return result
+
+    def parse_tool(self, message):
+        tool_outputs = message.get("tool_outputs", [])
+        tool_outputs_strs = []
+
+        for tool_output in tool_outputs:
+            if hasattr(tool_output, 'to_dict'):
+                tool_output = tool_output.to_dict()
+
+            tool_output_str = f"{self.tool_parser.tool_output_begin}\n"
+
+            outputs = tool_output.get("output")
+            if isinstance(outputs, list):
+                for chunk in outputs:
+                    chunk_type = chunk.get("type")
+                    if chunk_type == "text":
+                        tool_output_str += chunk.get("text", "")
+                    elif chunk_type == "image":
+                        tool_output_str += f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
+            else:
+                tool_output_str += str(outputs)
+
+            tool_output_str += f"\n{self.tool_parser.tool_output_end}"
+            tool_outputs_strs.append(tool_output_str)
+        tool_outputs_str = "\n".join(tool_outputs_strs)
+
+        return self.user_token + tool_outputs_str + self.eot_token
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        if completion_text.count("</think>") == 1:
+            reasoning, _, content = completion_text.partition("</think>")
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            reasoning = reasoning.strip()
+            content = content.strip()
+        elif not self.disable_thinking:
+            # generation was cut short during reasoning
+            reasoning = completion_text
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            reasoning = reasoning.strip()
+            content = ""
+        else:
+            # thinking is disabled, so everything is content
+            reasoning = ""
+            content = completion_text
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            content = content.strip()
+
+        if content:
+            # parse tool calls from content
+            tool_calls = self.tool_parser.parse(content)
+            begin_pattern = re.escape(self.tool_parser.tool_call_begin)
+            end_pattern = re.escape(self.tool_parser.tool_call_end)
+            content = re.sub(f"{begin_pattern}.*?{end_pattern}", "", content, flags=re.DOTALL)
+            content = content.strip()
+        else:
+            tool_calls = []
+
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+        }
+
+    def process_image_data(self, messages):
+        from PIL import Image
+        from qwen_vl_utils import fetch_image
+
+        messages = deepcopy(messages)
+        image_paths = []
+        for message in messages:
+            if message["role"] == "tool":
+                tool_outputs = message.get("tool_outputs", [])
+                for tool_output in tool_outputs:
+                    if hasattr(tool_output, 'to_dict'):
+                        tool_output = tool_output.to_dict()
+                    output = tool_output.get("output")
+                    if isinstance(output, list):
+                        for chunk in output:
+                            if isinstance(chunk, dict):
+                                chunk_type = chunk.get("type")
+                                if chunk_type == "image":
+                                    image_paths.append(chunk.get("image"))
+
+        image_data = []
+        for image_path in image_paths:
+            img = Image.open(os.path.join(self.image_folder_path, image_path)).convert("RGB")
+            if self.resize_width is not None:
+                w, h = img.size
+                aspect = h / w
+                target_h = int(self.resize_width * aspect)
+                target_w = round(self.resize_width / self.patch_factor) * self.patch_factor
+                target_h = round(target_h / self.patch_factor) * self.patch_factor
+                img = img.resize((target_w, target_h))
+
+            img = fetch_image({"image": img}, image_patch_size=self.patch_size)
+            image_data.append(img)
+
+        return image_data
+    
