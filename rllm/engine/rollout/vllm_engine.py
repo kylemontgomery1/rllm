@@ -129,7 +129,7 @@ class vLLMEngine(RolloutEngine):
                 "max_tokens": max_tokens,
                 "logprobs": sampling_params.get("logprobs", 1),
             },
-            image_data=image_data,
+            image_data=image_data if image_data else None,
         )
 
         completion_ids = output.token_ids

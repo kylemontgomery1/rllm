@@ -121,6 +121,11 @@ code-tools = [
     "together>=1.4",
 ]
 
+deepresearch = [
+    "e2b_code_interpreter",
+    "json5",
+]
+
 [tool.uv]
 override-dependencies = [
     "litellm[proxy]>=1.80.0",

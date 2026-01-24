@@ -952,12 +952,13 @@ class DeepResearchVChatTemplateParser:
         self.vision_start_token = "<|vision_start|>"
         self.vision_end_token = "<|vision_end|>"
 
-        self.patch_size = processor.image_processor.patch_size
-        self.merge_size = processor.image_processor.merge_size
-        self.patch_factor = self.patch_size * self.merge_size
+        if self.processor is not None:
+            self.patch_size = processor.image_processor.patch_size
+            self.merge_size = processor.image_processor.merge_size
+            self.patch_factor = self.patch_size * self.merge_size
 
-        self.image_folder_path = image_folder_path
-        self.resize_width = resize_width
+            self.image_folder_path = image_folder_path
+            self.resize_width = resize_width
         
         from rllm.parser.tool_parser import QwenToolParser
         self.tool_parser = QwenToolParser()
@@ -1157,6 +1158,10 @@ class DeepResearchVChatTemplateParser:
                                 chunk_type = chunk.get("type")
                                 if chunk_type == "image":
                                     image_paths.append(chunk.get("image"))
+
+        if self.processor is None and len(image_paths) > 0:
+            print("Found images in messages, but processor is not set. Skipping image processing.")
+            return None
 
         image_data = []
         for image_path in image_paths:
