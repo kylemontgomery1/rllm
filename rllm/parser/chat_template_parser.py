@@ -1,5 +1,6 @@
 import datetime
 import json
+import json5
 import logging
 import re
 import os
@@ -758,43 +759,88 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
         return self.parse_prompt_from_messages(messages, add_generation_prompt=add_generation_prompt, is_first_msg=is_first_msg, **kwargs)
 
     def parse_prompt_from_messages(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs):
-        from openai_harmony import Conversation, DeveloperContent, Message, ReasoningEffort, RenderConversationConfig, Role, SystemContent
-
-        # messages is a list[dict], where each dict is of the following structure:
-        # {
-        #     "role": str,
-        #     "content": str,
-        #     "reasoning": str, # optional
-        # }
+        from openai_harmony import Author, Conversation, DeveloperContent, Message, ReasoningEffort, RenderConversationConfig, Role, SystemContent, ToolDescription
 
         messages = deepcopy(messages)
         harmony_messages: list[Message] = []
 
-        if is_first_msg:
-            # 1. system prompt
-            reasoning_effort = ReasoningEffort(kwargs.get("reasoning_effort", "medium").capitalize())
-            system_message = SystemContent.new().with_reasoning_effort(reasoning_effort)
-            harmony_messages.append(Message.from_role_and_content(Role.SYSTEM, system_message))
+        # Extract tool config from kwargs - separate built-in tools from function tools
+        tools = list(kwargs.get("tools", []))
+        builtin_tools = [t for t in tools if t.name.startswith(("browser", "python"))]
+        function_tools = [t for t in tools if not t.name.startswith(("browser", "python"))]
 
-            # 2. developer prompt
-            if messages[0]["role"] == "system":
+        if is_first_msg:
+            # 1. system prompt (with built-in tools)
+            reasoning_effort = ReasoningEffort(kwargs.get("reasoning_effort", "medium").capitalize())
+            system_content = SystemContent.new().with_reasoning_effort(reasoning_effort).with_conversation_start_date(datetime.date.today().strftime("%Y-%m-%d"))
+            for t in builtin_tools:
+                if t.name.startswith("browser"):
+                    system_content = system_content.with_browser_tool()
+                elif t.name.startswith("python"):
+                    system_content = system_content.with_python_tool()
+            harmony_messages.append(Message.from_role_and_content(Role.SYSTEM, system_content))
+
+            # 2. developer prompt (with function tools)
+            instructions = None
+            if messages and messages[0]["role"] == "system":
                 instructions = messages.pop(0).get("content")
-                developer_message = DeveloperContent.new().with_instructions(instructions)
-                harmony_messages.append(Message.from_role_and_content(Role.DEVELOPER, developer_message))
+
+            developer_content = DeveloperContent.new()
+            if instructions:
+                developer_content = developer_content.with_instructions(instructions)
+            if function_tools:
+                tool_descriptions = [
+                    ToolDescription(
+                        name=t.json["function"]["name"],
+                        description=t.json["function"].get("description", ""),
+                        parameters=t.json["function"].get("parameters"),
+                    )
+                    for t in function_tools
+                ]
+                developer_content = developer_content.with_function_tools(tool_descriptions)
+
+            if instructions or function_tools:
+                harmony_messages.append(Message.from_role_and_content(Role.DEVELOPER, developer_content))
 
         # 3. the rest of the messages
         for message in messages:
             if message["role"] == "user":
                 harmony_messages.append(Message.from_role_and_content(Role.USER, message["content"]))
             elif message["role"] == "assistant":
-                reasoning = message.get("reasoning", None)
-                content = message.get("content", None)
+                reasoning = message.get("reasoning")
+                content = message.get("content")
+                tool_calls = message.get("tool_calls", [])
                 if reasoning:
                     harmony_messages.append(Message.from_role_and_content(Role.ASSISTANT, reasoning).with_channel("analysis"))
+                for tc in tool_calls:
+                    name = tc.name if hasattr(tc, "name") else tc["name"]
+                    args = tc.arguments if hasattr(tc, "arguments") else tc["arguments"]
+                    if not args and tc.metadata and "raw_arguments" in tc.metadata:
+                        dumped_args = tc.metadata["raw_arguments"]
+                    else:
+                        dumped_args = json.dumps(args)
+                    is_builtin = name.startswith(("browser", "python"))
+                    channel = "analysis" if is_builtin else "commentary"
+                    content_type = "code" if is_builtin else "json"
+                    harmony_messages.append(
+                        Message.from_role_and_content(Role.ASSISTANT, dumped_args)
+                        .with_channel(channel)
+                        .with_recipient(name)
+                        .with_content_type(content_type)
+                    )
                 if content:
                     harmony_messages.append(Message.from_role_and_content(Role.ASSISTANT, content).with_channel("final"))
             elif message["role"] == "tool":
-                raise NotImplementedError("Tool messages are not supported yet")
+                tool_outputs = message.get("tool_outputs", [])
+                for tool_output in tool_outputs:
+                    name = tool_output.name
+                    is_builtin = name.startswith(("browser", "python"))
+                    channel = "analysis" if is_builtin else "commentary"
+                    harmony_messages.append(
+                        Message.from_author_and_content(Author.new(Role.TOOL, name), str(tool_output))
+                        .with_channel(channel)
+                        .with_recipient("assistant")
+                    )
             else:
                 raise NotImplementedError(f"Unsupported message role: {message['role']}")
 
@@ -819,25 +865,30 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
 
         # NOTE: harmony will throw an error if the sequence ends during the header (e.g., due to length)
         harmony_messages = self.enc.parse_messages_from_completion_tokens(completion_ids, role=Role.ASSISTANT)
-
-        analysis = ""
-        final = ""
         for message in harmony_messages:
-            content = message.content[0].text
+            print(message)
+
+        reasoning = ""
+        content = ""
+        tool_calls = []
+
+        for message in harmony_messages:
+            text = message.content[0].text
             channel = message.channel
+            recipient = message.recipient
 
-            if channel == "analysis":
-                analysis += content
+            if recipient:
+                try:
+                    arguments = json5.loads(text) if text.strip() else {}
+                    tool_calls.append(ToolCall(name=recipient, arguments=arguments))
+                except Exception:
+                    tool_calls.append(ToolCall(name=recipient, arguments={}, metadata={"raw_arguments": text}))
+            elif channel == "analysis":
+                reasoning += text
             elif channel == "final":
-                final += content
+                content += text
 
-        # TODO: handle tool calls
-
-        return {
-            "content": final,
-            "reasoning": analysis,
-            "tool_calls": [],
-        }
+        return {"content": content, "reasoning": reasoning, "tool_calls": tool_calls}
 
 
 class DeepSeekV32ExpChatTemplateParser(ChatTemplateParser):

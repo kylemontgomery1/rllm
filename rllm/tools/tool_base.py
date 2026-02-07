@@ -12,6 +12,7 @@ class ToolCall:
     name: str
     arguments: dict[str, Any]
     id: str | None = None
+    metadata: dict | None = None
 
     def to_dict(self):
         return {"name": self.name, "arguments": self.arguments}
