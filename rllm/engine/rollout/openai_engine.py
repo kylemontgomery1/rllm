@@ -36,7 +36,7 @@ class OpenAIEngine(RolloutEngine):
             print(f"No tokenizer provided to OpenAIEngine, will use the chat completions endpoint for model {self.model}.")
             self._use_chat_completions = True
 
-        self.client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self.client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=3600)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
     @staticmethod

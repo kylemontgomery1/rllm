@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class AgentWorkflowEngine:
-    def __init__(self, workflow_cls: type[Workflow], workflow_args: dict, rollout_engine: RolloutEngine, config=None, n_parallel_tasks: int = 128, retry_limit: int = 3, raise_on_error: bool = True, episode_logger=None, **kwargs):
+    def __init__(self, workflow_cls: type[Workflow], workflow_args: dict, rollout_engine: RolloutEngine, config=None, n_parallel_tasks: int = 128, retry_limit: int = 3, raise_on_error: bool = True, episode_logger=None, output_dir: str | None = None, **kwargs):
         """Initialize the AgentWorkflowEngine.
 
         Args:
@@ -53,6 +53,7 @@ class AgentWorkflowEngine:
         self.workflow_queue = None
 
         # Episode logging support
+        self.output_dir = Path(output_dir) if output_dir else None
         self.episode_logger = episode_logger
         self.current_step = 0
         self.current_epoch = 0
@@ -167,14 +168,14 @@ class AgentWorkflowEngine:
                 task_id, rollout_idx, episode = await future
 
                 # Save episode to JSON file
-                try:
-                    output_dir = Path("logs/asearcher-rollout")
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    episode_path = output_dir / f"{episode.id}.json"
-                    with open(episode_path, "w") as f:
-                        json.dump(episode.to_dict(), f, indent=4, ensure_ascii=False)
-                except Exception as e:
-                    logger.warning(f"Failed to save episode {episode.id}: {e}")
+                if self.output_dir is not None:
+                    try:
+                        self.output_dir.mkdir(parents=True, exist_ok=True)
+                        episode_path = self.output_dir / f"{task_id}:{rollout_idx}.json"
+                        with open(episode_path, "w") as f:
+                            json.dump(episode.to_dict(), f, indent=4, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(f"Failed to save episode {task_id}:{rollout_idx}: {e}")
 
                 state = task_states[task_id]
                 state["episodes"].append(episode)

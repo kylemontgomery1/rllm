@@ -865,8 +865,6 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
 
         # NOTE: harmony will throw an error if the sequence ends during the header (e.g., due to length)
         harmony_messages = self.enc.parse_messages_from_completion_tokens(completion_ids, role=Role.ASSISTANT)
-        for message in harmony_messages:
-            print(message)
 
         reasoning = ""
         content = ""
