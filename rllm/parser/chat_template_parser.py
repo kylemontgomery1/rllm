@@ -452,7 +452,7 @@ class QwenChatTemplateParser(ChatTemplateParser):
             result = self.assistant_token
             if reasoning and accumulate_reasoning:
                 result += "<think>\n" + reasoning
-                if content:
+                if content or tool_calls:
                     result += "\n</think>\n\n"
 
             if content:

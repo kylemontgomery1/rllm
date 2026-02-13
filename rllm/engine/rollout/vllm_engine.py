@@ -85,7 +85,7 @@ class vLLMEngine(RolloutEngine):
         return cls(server_handles=server_handles, tokenizer=tokenizer, processor=processor, chat_parser=chat_parser, **kwargs)
 
     async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
-        request_id = kwargs.pop("request_id", uuid4().hex)
+        request_id = kwargs.pop("application_id", None) or uuid4().hex
         enforce_max_prompt_length = kwargs.pop("enforce_max_prompt_length", True)
         tools = kwargs.pop("tools", self.tools)
         accumulate_reasoning = kwargs.pop("accumulate_reasoning", self.accumulate_reasoning)
@@ -127,7 +127,7 @@ class vLLMEngine(RolloutEngine):
                 "top_p": sampling_params.get("top_p", 1.0),
                 "top_k": sampling_params.get("top_k", -1),
                 "max_tokens": max_tokens,
-                "logprobs": sampling_params.get("logprobs", 1),
+                "logprobs": sampling_params.get("logprobs", 0),
             },
             image_data=image_data if image_data else None,
         )
@@ -173,6 +173,7 @@ async def start_server(model_path: str, tp: int = 8, num_replicas: int = 1, gpus
         enforce_eager=False,
         enable_sleep_mode=False,
         free_cache_engine=False,
+        disable_log_stats=False,
     )
 
     model_config = HFModelConfig(path=model_path)
