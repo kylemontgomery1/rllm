@@ -35,8 +35,10 @@ class vLLMEngine(RolloutEngine):
         accumulate_reasoning: bool = False,
         disable_thinking: bool = False,
         chat_parser=None,
+        session_aware_routing: bool = False,
     ):
         self.server_manager = AsyncLLMServerManager(config=None, server_handles=server_handles)
+        self.session_aware_routing = session_aware_routing
         self.tokenizer = tokenizer
         self.processor = processor
         self.max_prompt_length = max_prompt_length
@@ -83,6 +85,14 @@ class vLLMEngine(RolloutEngine):
                 processor = None
 
         return cls(server_handles=server_handles, tokenizer=tokenizer, processor=processor, chat_parser=chat_parser, **kwargs)
+
+    def acquire_session(self, request_id: str):
+        if self.session_aware_routing and hasattr(self.server_manager, "acquire_session"):
+            self.server_manager.acquire_session(request_id)
+
+    def release_session(self, request_id: str):
+        if self.session_aware_routing and hasattr(self.server_manager, "release_session"):
+            self.server_manager.release_session(request_id)
 
     async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
         request_id = kwargs.pop("application_id", None) or uuid4().hex

@@ -59,6 +59,12 @@ class RolloutEngine:
     async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
         raise NotImplementedError("get_model_response is not implemented")
 
+    def acquire_session(self, request_id: str):
+        pass
+
+    def release_session(self, request_id: str):
+        pass
+
     async def wake_up(self):
         pass
 

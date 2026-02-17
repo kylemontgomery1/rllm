@@ -102,9 +102,10 @@ class AgentWorkflowEngine:
             Exception: If task fails permanently after retry_limit attempts and raise_on_error is True.
         """
         workflow = await self.workflow_queue.get()
+        uid = f"{task_id}:{rollout_idx}"
+        self.rollout_engine.acquire_session(uid)
         try:
             for retry_attempt in range(1, self.retry_limit + 1):
-                uid = f"{task_id}:{rollout_idx}"
                 episode = await workflow.run_with_termination_handling(task=task, uid=uid, **kwargs)
 
                 # Display rewards for all trajectories
@@ -130,6 +131,7 @@ class AgentWorkflowEngine:
             return task_id, rollout_idx, episode
 
         finally:
+            self.rollout_engine.release_session(uid)
             await self.workflow_queue.put(workflow)
 
     async def execute_tasks(self, tasks: list[dict], task_ids: list[str] | None = None, **kwargs) -> list[Episode]:
