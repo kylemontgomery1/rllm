@@ -60,13 +60,18 @@ markdown_extensions:
   - pymdownx.snippets:
       base_path: ['.', '..']
       check_paths: true
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - admonition
   - pymdownx.details
   - pymdownx.tabbed:
       alternate_style: true
   - tables
   - footnotes
+      
 
 nav:
   - Home: 
@@ -82,6 +87,8 @@ nav:
         - AgentTrainer for RL Training: core-concepts/training.md
         - RL Algorithms for Agents: core-concepts/rl-algos.md
         - SDK Overview: core-concepts/sdk.md
+      - Projects:
+        - FinQA Financial Agent: projects/finqa.md
       - Examples:
         - Training a LangGraph Search Agent using the rLLM SDK: examples/sdk_langgraph_rag.md
         - RL Training with Tinker: examples/tinker_rl.md
@@ -91,6 +98,7 @@ nav:
         - Eval Protocol Integration: core-concepts/eval-protocol.md
       - References:
         - Examples: examples/index.md
+        - Projects: projects/index.md
         - API Reference: api/index.md
         - Contributing: contributing.md
         - Blogs: https://rllm-project.com/blog.html
@@ -112,6 +120,7 @@ nav:
       - Solver-Judge Workflow with rLLM SDK: examples/sdk_solver_judge.md
       - LangGraph RAG Agent with rLLM SDK: examples/sdk_langgraph_rag.md
       - RL Training with Tinker: examples/tinker_rl.md
+      - Verifiers (Prime Intellect Hub): examples/verifiers.md
       - LoRA Training in rLLM (with verl): examples/gsm8k_lora.md
       - Solver-Judge Workflow: examples/solver_judge.md
       - Vision-Language Models (VLM): examples/vlm.md
@@ -121,6 +130,17 @@ nav:
       - Search Agent: examples/search.md
       - FrozenLake Agent: examples/frozenlake.md
       - Math SFT: examples/sft.md
+  - Experimental:
+      - Experimental Features: experimental/index.md
+      - Unified Workflow Trainer:
+        - Unified Training Loop: experimental/unified-trainer.md
+        - Backend Protocol: experimental/backend-protocol.md
+        - Configuration: experimental/rllm-and-backend-config.md
+      - rLLM UI:
+        - Training Dashboard: experimental/rllm-ui.md
+  - Projects:
+      - Overview: projects/index.md
+      - FinQA: projects/finqa.md
   - API Reference:
       - Overview: api/index.md
       - Agents:
