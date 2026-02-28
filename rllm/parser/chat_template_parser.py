@@ -777,7 +777,10 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
                 if t.name.startswith("browser"):
                     system_content = system_content.with_browser_tool()
                 elif t.name.startswith("python"):
-                    system_content = system_content.with_python_tool()
+                    if hasattr(t, "tool_config"):
+                        system_content = system_content.with_tools(t.tool_config)
+                    else:
+                        system_content = system_content.with_python_tool()
             harmony_messages.append(Message.from_role_and_content(Role.SYSTEM, system_content))
 
             # 2. developer prompt (with function tools)

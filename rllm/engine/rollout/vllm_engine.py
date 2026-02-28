@@ -46,6 +46,7 @@ class vLLMEngine(RolloutEngine):
         self.sampling_params = sampling_params or {}
         self.tools = tools or []
         self.accumulate_reasoning = accumulate_reasoning
+        self.reasoning_effort = self.sampling_params.pop("reasoning_effort", "medium")
         self.chat_parser = chat_parser or ChatTemplateParser.get_parser(
             tokenizer, processor=processor, disable_thinking=disable_thinking
         )
@@ -99,18 +100,15 @@ class vLLMEngine(RolloutEngine):
         enforce_max_prompt_length = kwargs.pop("enforce_max_prompt_length", True)
         tools = kwargs.pop("tools", self.tools)
         accumulate_reasoning = kwargs.pop("accumulate_reasoning", self.accumulate_reasoning)
+        reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
 
         # Merge sampling params
         sampling_params = self.sampling_params.copy()
         sampling_params.update(kwargs)
         max_tokens = sampling_params.pop("max_tokens", sampling_params.pop("max_new_tokens", self.max_response_length))
 
-        # Convert tools to JSON format
-        if tools:
-            tools = [tool.json if isinstance(tool, Tool) else tool for tool in tools]
-
         # Parse messages to prompt
-        prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning)
+        prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning, reasoning_effort=reasoning_effort)
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
 
         # Handle images
