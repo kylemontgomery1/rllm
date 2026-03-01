@@ -176,7 +176,7 @@ class Workflow(ABC):
         """
         total_reward = 0
         for trajectory in episode.trajectories:
-            total_reward += trajectory.reward
+            total_reward += trajectory.reward or 0
         episode.is_correct = total_reward > 0
 
     def collect_metrics(self, episode: Episode) -> None:

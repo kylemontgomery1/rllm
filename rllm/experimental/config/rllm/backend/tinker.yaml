@@ -88,3 +88,9 @@ rllm:
   rollout:
     n: ${oc.select:training.group_size, 8}
     n_val: ${oc.select:validation.group_size, 1}
+  # Streaming Training (experimental)
+  # Overlaps sampling and training: each trajectory group gets its own forward_backward
+  # as it completes, without waiting for the full batch.
+  # Incompatible with fuse_forward_backward_and_optim_step and episode-level rejection sampling.
+  streaming_minibatch:
+    enable: false
