@@ -128,6 +128,14 @@ code-tools = [
 deepresearch = [
     "e2b_code_interpreter",
     "json5",
+    "trafilatura",
+    "playwright",
+    "pymupdf",
+    "pymupdf4llm",
+    "markdown",
+    "python-dotenv",
+    "modal",
+    "aiohttp",
 ]
 
 [tool.uv]

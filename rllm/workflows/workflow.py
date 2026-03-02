@@ -189,7 +189,7 @@ class Workflow(ABC):
         metrics = defaultdict(list)
         for traj in episode.trajectories:
             name = traj.name
-            metrics[name].append(traj.reward)
+            metrics[name].append(traj.reward or 0.0)
         episode.metrics = {f"{k}_acc": float(np.mean(v)) for k, v in metrics.items()}
 
     def postprocess_episode(self, episode: Episode, termination_reason: TerminationReason = None, error: dict = None) -> Episode:
