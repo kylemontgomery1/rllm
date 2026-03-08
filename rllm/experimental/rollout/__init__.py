@@ -1,9 +1,18 @@
 from typing import TYPE_CHECKING
 
 from .rollout_engine import ModelOutput, RolloutEngine
-from .types import TinkerTokenInput, TinkerTokenOutput, TokenInput, Tokenizer, TokenOutput, VerlTokenInput, VerlTokenOutput
+from .types import (
+    TinkerTokenInput,
+    TinkerTokenOutput,
+    TokenInput,
+    Tokenizer,
+    TokenOutput,
+    VerlTokenInput,
+    VerlTokenOutput,
+)
 
 if TYPE_CHECKING:
+    from .fireworks_engine import FireworksEngine
     from .tinker_engine import TinkerEngine
     from .verl_engine import VerlEngine
 
@@ -11,6 +20,7 @@ __all__ = [
     "ModelOutput",
     # Rollout engines
     "RolloutEngine",
+    "FireworksEngine",
     "TinkerEngine",
     "VerlEngine",
     # Token input/output types
@@ -33,4 +43,9 @@ def __getattr__(name):
         from .verl_engine import VerlEngine as _VerlEngine
 
         return _VerlEngine
+
+    if name == "FireworksEngine":
+        from .fireworks_engine import FireworksEngine as _FireworksEngine
+
+        return _FireworksEngine
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

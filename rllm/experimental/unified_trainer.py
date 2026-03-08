@@ -27,7 +27,10 @@ from rllm.experimental.common.rejection_sampling import (
     RejectionSamplingState,
     apply_rejection_sampling_and_filtering,
 )
-from rllm.experimental.common.transform import _default_traj_grouping_hook, transform_episodes_to_trajectory_groups
+from rllm.experimental.common.transform import (
+    _default_traj_grouping_hook,
+    transform_episodes_to_trajectory_groups,
+)
 from rllm.experimental.common.visualization import visualize_trajectory_last_steps
 from rllm.experimental.engine.unified_workflow_engine import UnifiedWorkflowEngine
 from rllm.experimental.protocol import BackendProtocol
@@ -514,6 +517,19 @@ class AgentTrainer:
             from rllm.trainer.tinker.tinker_launcher import TinkerTrainerLauncher
 
             self.launcher = TinkerTrainerLauncher(
+                config=config,
+                workflow_class=workflow_class,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                workflow_args=workflow_args,
+                **kwargs,
+            )
+        elif backend == "fireworks":
+            from rllm.trainer.fireworks.fireworks_launcher import (
+                FireworksTrainerLauncher,
+            )
+
+            self.launcher = FireworksTrainerLauncher(
                 config=config,
                 workflow_class=workflow_class,
                 train_dataset=train_dataset,

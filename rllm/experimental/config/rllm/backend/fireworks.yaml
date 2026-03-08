@@ -1,0 +1,102 @@
+# @package _global_
+
+# Fireworks Backend Configuration for rLLM
+# This config is used when training agents with Fireworks backend
+# Unified configuration supporting both workflow and agent training modes
+
+# Fireworks-specific settings
+fireworks_base_url: "https://api.fireworks.ai"  # Fireworks service URL (null for local)
+fuse_forward_backward_and_optim_step: false
+
+display_name: "rl-trainer"  # Display name for the training job in Fireworks dashboard
+account: "rllm-project"
+fireworks_base_url: "https://api.fireworks.ai"  # Fireworks service URL
+
+# Model Configuration
+model:
+  name: accounts/fireworks/models/qwen3-30b-a3b-instruct-2507  # Default model for DeepResearch
+  lora_rank: 0         # LoRA rank 0 means no LoRA fine-tuning, which is compatible with Fireworks backend
+
+# Training Configuration (fireworks-specific)
+training:
+  group_size: ???  # Number of rollouts per prompt (for GRPO)
+  learning_rate: 2e-5  # 2e-5 for MATH dataset
+  lr_schedule: "cosine"  # "constant", "linear", "cosine"
+  warmup_steps_ratio: 0.0  # Warmup steps as ratio of total steps (between 0 and 1)
+  # below are the Adam optimizer parameters
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+  max_length: 32768
+
+  max_samples_per_fwd_bwd: 4  # Maximum number of samples (prompts x completions) per forward/backward pass
+  min_samples_per_fwd_bwd: 4  # Minimum number of samples per forward/back
+  completions_per_prompt: 4  # Number of completions to generate per prompt, used to calculate samples per fwd/bwd
+
+  default_local_dir: '/tmp/rllm-tinker-checkpoints'
+  resume_from_tinker_id: null  # Tinker model ID path to resume from (e.g., tinker://uuid/weights/000060)
+
+deployment:
+  deployment_id: qwen3-30b-instruct-deepmath-v4
+  deployment_shape: accounts/pyroworks-dev/deploymentShapes/rft-qwen3-30b-a3b-instruct-r3
+  tokenizer_model: Qwen/Qwen3-30B-A3B-Instruct-2507
+
+hotload:
+  hot_load_interval: 1
+  first_checkpoint_type: base
+  hot_load_before_training: true
+  hot_load_timeout: 600
+
+training_infra:
+  training_shape_id: ts-qwen3-30b-a3b-instruct-policy
+  region: US_OHIO_1
+
+# Validation Configuration
+validation:
+  group_size: ???
+
+# Sampling Configuration
+sampling:
+  train:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+  val:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+# Workflow Configuration (for workflow training mode)
+workflow:
+  n_parallel_tasks: 256
+  retry_limit: 3
+
+# Agent Configuration (for agent training mode)
+agent:
+  max_steps: 1  # Single-turn vs multi-turn
+  agent_args: {}
+
+# Tinker Engine Configuration
+rollout_engine:
+  reasoning_effort: "medium"
+  accumulate_reasoning: false
+  disable_thinking: false
+  bypass_render_with_parser: false
+  renderer_name: null
+
+# Data Configuration
+data:
+  train_files: null
+  val_files: null
+  max_prompt_length: 2048
+  max_response_length: 2048
+  train_batch_size: 64
+  val_batch_size: 32
+
+# Overriding the rLLM-common config with Fireworks-specific ones
+# Only override if the algorithm values are not None, otherwise still use the rLLM-common config
+rllm:
+  backend: fireworks
+  rollout:
+    n: ${oc.select:training.group_size, 8}
+    n_val: ${oc.select:validation.group_size, 1}
