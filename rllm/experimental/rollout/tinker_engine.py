@@ -295,6 +295,7 @@ class TinkerEngine(RolloutEngine):
             prompt_ids=prompt_ids,
             completion_ids=response_tokens,
             logprobs=logprobs,
+            routing_matrices=getattr(sampled_sequence, 'routing_matrices', None),
             prompt_length=_flat_token_input_length(token_input),
             completion_length=len(response_tokens),
             finish_reason=finish_reason,

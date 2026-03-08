@@ -42,6 +42,7 @@ class Step:
     prompt_ids: list[int] | list[Any] = field(default_factory=list)
     response_ids: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
+    routing_matrices: list[str] | None = None  # per-token routing matrices (R3, transient)
 
     chat_completions: list[dict[str, str]] = field(default_factory=list)
 
@@ -73,6 +74,8 @@ class Step:
             self.response_ids = self.model_output.completion_ids
         if len(self.logprobs) == 0 and self.model_output.logprobs is not None:
             self.logprobs = self.model_output.logprobs
+        if self.routing_matrices is None and getattr(self.model_output, 'routing_matrices', None) is not None:
+            self.routing_matrices = self.model_output.routing_matrices
 
         # check that the token ids are filled
         # TODO(listar2000): this might cause compatibility issue. Double check if we should make these assertions.
@@ -141,6 +144,7 @@ class Step:
             prompt_ids=model_output.prompt_ids or [],
             response_ids=model_output.completion_ids or [],
             logprobs=model_output.logprobs or [],
+            routing_matrices=getattr(model_output, 'routing_matrices', None),
             chat_completions=(messages or []) + [{"role": "assistant", "content": model_output.content, "reasoning": model_output.reasoning}],
             thought=model_output.reasoning or "",
             action=action,

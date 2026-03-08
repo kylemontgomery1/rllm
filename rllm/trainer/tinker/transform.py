@@ -36,7 +36,7 @@ def _flatten_token_input(token_input: TinkerTokenInput) -> TinkerTokenInput:
     return flattened
 
 
-def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
+def trajectory_to_datums(traj: Trajectory, router_replay: bool = False) -> list[tinker.Datum]:
     """
     Return one or more Datum objects corresponding to the trajectory.
     If the sequence grows by appending, i.e., each successive observation contains
@@ -61,6 +61,7 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
         sampled_logprobs: list[float] = []
         advantages: list[float] = []
         mask: list[float] = []
+        routing_matrices: list[str] = []
 
         @classmethod
         def clear(cls):
@@ -68,6 +69,7 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
             cls.sampled_logprobs = []
             cls.advantages = []
             cls.mask = []
+            cls.routing_matrices = []
 
     def make_datum_from_state():
         all_tokens_T = _flat_token_input_to_model_input(SequenceAccumulator.full_sequence)
@@ -77,6 +79,9 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
         advantages_T = SequenceAccumulator.advantages[1:]
         mask_T = SequenceAccumulator.mask[1:]
         assert input_tokens_T.length == len(target_tokens_T) == len(sampled_logprobs_T) == len(advantages_T) == len(mask_T)
+        if router_replay and SequenceAccumulator.routing_matrices:
+            rm_shifted = SequenceAccumulator.routing_matrices[1:]  # match rightshift
+            input_tokens_T = input_tokens_T.model_copy(update={"routing_matrices": rm_shifted})
         return tinker.Datum(
             model_input=input_tokens_T,
             loss_fn_inputs={
@@ -118,6 +123,12 @@ def trajectory_to_datums(traj: Trajectory) -> list[tinker.Datum]:
         SequenceAccumulator.sampled_logprobs.extend([0.0] * delta_token_input_length + output_logprobs)
         SequenceAccumulator.advantages.extend([0] * delta_token_input_length + advantages)
         SequenceAccumulator.mask.extend([0.0] * delta_token_input_length + [1.0] * len(output_token_ids))
+        if router_replay:
+            step_rm = step.routing_matrices or []
+            SequenceAccumulator.routing_matrices.extend(
+                [""] * delta_token_input_length
+                + (list(step_rm) if step_rm else [""] * len(output_token_ids))
+            )
 
     if SequenceAccumulator.full_sequence:
         data.append(make_datum_from_state())
@@ -150,8 +161,8 @@ def transform_trajectory_groups_to_datums(
     for group in trajectory_groups:
         for trajectory in group.trajectories:
             if algorithm_config.estimator_map:
-                datums_dict[group.group_role].extend(trajectory_to_datums(trajectory))
+                datums_dict[group.group_role].extend(trajectory_to_datums(trajectory, router_replay=algorithm_config.router_replay))
             else:
-                datums.extend(trajectory_to_datums(trajectory))
+                datums.extend(trajectory_to_datums(trajectory, router_replay=algorithm_config.router_replay))
 
     return (datums if not algorithm_config.estimator_map else datums_dict), adv_metrics

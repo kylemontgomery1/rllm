@@ -16,6 +16,7 @@ class ModelOutput:
     multi_modal_inputs: dict[str, list] | None = None
     logprobs: list[float] | None = None  # completion logprobs
     prompt_logprobs: list[float] | None = None  # prompt logprobs aligned to prompt_ids
+    routing_matrices: list[str] | None = None  # per-token routing matrices (R3, transient)
     prompt_length: int = 0
     completion_length: int = 0
     finish_reason: str | None = None

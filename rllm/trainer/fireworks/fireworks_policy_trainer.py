@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
 
 import tinker
-from fireworks.training.cookbook.utils import ReconnectableClient
+from training.utils.client import ReconnectableClient
 from fireworks.training.sdk import WeightSyncer
 from tinker.types import AdamParams
 
@@ -26,7 +26,6 @@ from rllm.experimental.common import (
     AlgorithmConfig,
     CompactFilteringConfig,
     TransformConfig,
-    rLLMAdvantageEstimator,
 )
 from rllm.trainer.tinker.tinker_policy_trainer import (
     compute_schedule_lr_multiplier,
@@ -35,13 +34,6 @@ from rllm.trainer.tinker.tinker_policy_trainer import (
 from rllm.trainer.tinker.transform import transform_trajectory_groups_to_datums
 
 logger = logging.getLogger(__name__)
-
-
-ADV_TO_LOSS_FN_AUTO_MAP = {
-    rLLMAdvantageEstimator.REINFORCE: "importance_sampling",
-    rLLMAdvantageEstimator.GRPO: "ppo",
-    rLLMAdvantageEstimator.OTHER: "importance_sampling",
-}
 
 
 class FireworksPolicyTrainer:
@@ -60,6 +52,8 @@ class FireworksPolicyTrainer:
     - Trajectory collection
     - Sampling
     """
+
+    _METRIC_SKIP_KEYS = {"step_id", "step"}
 
     def __init__(
         self,
@@ -97,7 +91,11 @@ class FireworksPolicyTrainer:
     # Initialization
     # ------------------------------------------------------------------
 
-    async def initialize_async(self, resume_from_checkpoint: bool = True) -> int:
+    async def initialize_async(
+        self,
+        resume_from_checkpoint: bool = True,
+        hot_load_before_training: bool = False,
+    ) -> int:
         """Initialize or resume training.
 
         Handles checkpoint resume via ``FiretitanTrainingClient.list_checkpoints``
@@ -106,6 +104,8 @@ class FireworksPolicyTrainer:
         Args:
             resume_from_checkpoint: If True, attempt to resume from the
                 last DCP checkpoint.
+            hot_load_before_training: If True, push initial weights to the
+                inference deployment before the first training step.
 
         Returns:
             The starting global step (0 when training from scratch).
@@ -117,7 +117,8 @@ class FireworksPolicyTrainer:
 
         if start_step == 0:
             logger.info("Starting training from scratch with model: %s", self.config.model.name)
-            await self._initial_weight_sync()
+            if hot_load_before_training:
+                await self._initial_weight_sync()
 
         return start_step
 
@@ -137,7 +138,7 @@ class FireworksPolicyTrainer:
         logger.info("Resuming from checkpoint: %s", latest_name)
 
         checkpoint_ref = inner.resolve_checkpoint_path(latest_name)
-        await asyncio.to_thread(lambda: self.training_client.load_state_with_optimizer(checkpoint_ref).result())
+        await asyncio.to_thread(self.training_client.load_state_with_optimizer, checkpoint_ref)
 
         try:
             step = int(latest_name.split("-")[-1])
@@ -173,32 +174,191 @@ class FireworksPolicyTrainer:
             loss_fn_inputs={k: v for k, v in datum.loss_fn_inputs.items() if k != "mask"},
         )
 
-    @require_training_client
-    async def _get_forward_backward_futures(
-        self,
-        training_datums: list[tinker.Datum] | dict[str, list[tinker.Datum]],
-        estimator_map: dict[str, rLLMAdvantageEstimator],
-        algorithm_config: AlgorithmConfig,
-    ) -> list[Any]:
-        fwd_bwd_futures = []
-        if isinstance(training_datums, dict):
-            for group_role, datums in training_datums.items():
-                estimator = estimator_map.get(group_role, self.algorithm_config.estimator)
-                loss_fn = algorithm_config.loss_fn or ADV_TO_LOSS_FN_AUTO_MAP[estimator]
-                fwd_bwd_future = self.training_client.forward_backward_custom(
-                    [self._remove_mask(datum) for datum in datums],
-                    loss_fn,
-                )
-                fwd_bwd_futures.append(fwd_bwd_future)
-        else:
-            loss_fn = algorithm_config.loss_fn or ADV_TO_LOSS_FN_AUTO_MAP[algorithm_config.estimator]
-            fwd_bwd_future = self.training_client.forward_backward_custom(
-                [self._remove_mask(datum) for datum in training_datums],
-                loss_fn,
-            )
-            fwd_bwd_futures.append(fwd_bwd_future)
+    @staticmethod
+    def _strip_routing_matrices(datum: tinker.Datum) -> tinker.Datum:
+        """Strip routing matrices from a datum (reference model uses its own routing)."""
+        mi = datum.model_input
+        if getattr(mi, 'routing_matrices', None) is not None:
+            mi = mi.model_copy(update={"routing_matrices": None})
+            return tinker.Datum(model_input=mi, loss_fn_inputs=datum.loss_fn_inputs)
+        return datum
 
-        return fwd_bwd_futures
+    # ------------------------------------------------------------------
+    # Custom loss helpers (cookbook callable path)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_inf_logprobs_and_prompt_lens(
+        datums: list[tinker.Datum],
+    ) -> tuple[list[list[float]], list[int]]:
+        """Extract inference logprobs and prompt lengths from datums.
+
+        Inference logprobs are stored in ``datum.loss_fn_inputs["logprobs"]``.
+        Prompt length is derived from the mask (index of first nonzero element).
+        """
+        inf_logprobs: list[list[float]] = []
+        prompt_lens: list[int] = []
+        for datum in datums:
+            lp = datum.loss_fn_inputs["logprobs"].data
+            inf_logprobs.append(list(lp))
+
+            mask = datum.loss_fn_inputs["mask"].data
+            prompt_len = len(mask) + 1
+            for i, m in enumerate(mask):
+                if m != 0:
+                    prompt_len = i + 1
+                    break
+            prompt_lens.append(prompt_len)
+        return inf_logprobs, prompt_lens
+
+    @staticmethod
+    def _extract_scalar_advantages(datums: list[tinker.Datum]) -> list[float]:
+        """Extract one scalar advantage per datum.
+
+        rllm stores per-token advantages (broadcast for GRPO). The cookbook
+        expects one scalar per datum — take the first response-token value.
+        """
+        advantages: list[float] = []
+        for datum in datums:
+            adv_data = datum.loss_fn_inputs["advantages"].data
+            mask_data = datum.loss_fn_inputs["mask"].data
+            # Find first response token (first nonzero mask position)
+            scalar = 0.0
+            for i, m in enumerate(mask_data):
+                if m != 0:
+                    scalar = float(adv_data[i])
+                    break
+            advantages.append(scalar)
+        return advantages
+
+    @staticmethod
+    def _prepare_datum_for_custom_loss(datum: tinker.Datum) -> tinker.Datum:
+        """Prepare a datum for the cookbook callable loss path.
+
+        Renames ``mask`` → ``loss_mask`` (cookbook's ``_get_loss_mask`` reads
+        ``loss_fn_inputs["loss_mask"]``) and removes fields the callable
+        computes internally (``advantages``, ``logprobs``).
+        """
+        new_inputs = {}
+        for k, v in datum.loss_fn_inputs.items():
+            if k == "mask":
+                new_inputs["loss_mask"] = v
+            elif k in ("advantages", "logprobs"):
+                continue  # handled by the callable
+            else:
+                new_inputs[k] = v
+        return tinker.Datum(model_input=datum.model_input, loss_fn_inputs=new_inputs)
+
+    async def _compute_proximal_logprobs(
+        self,
+        datums: list[tinker.Datum],
+    ) -> list[list[float]]:
+        """Compute proximal (π_old) logprobs via policy.forward().
+
+        Only called when ``bypass_mode=False`` (3-policy / decoupled PPO).
+        """
+        stripped = [self._remove_mask(d) for d in datums]
+        prox_fwd = await asyncio.to_thread(
+            self.training_client.forward, stripped, "cross_entropy",
+        )
+        return [out["logprobs"].data for out in prox_fwd.loss_fn_outputs]
+
+    def _build_custom_loss(
+        self,
+        algorithm_config: AlgorithmConfig,
+        advantages: list[float],
+        ref_logprobs: list[list[float]],
+        prompt_lens: list[int],
+        inf_logprobs: list[list[float]],
+        prox_logprobs: list[list[float]],
+    ):
+        """Build a cookbook callable loss function.
+
+        Returns a callable ``(data, logprobs_list) -> (loss, metrics)``
+        suitable for ``forward_backward_custom``.
+        """
+        from training.utils.rl.losses import build_loss_fn
+        from training.utils.rl.importance_sampling import ISConfig
+        from training.utils.rl.dapo import DAPOConfig
+        from training.utils.rl.gspo import GSPOConfig
+        from training.utils.rl.cispo import CISPOConfig
+
+        rc = algorithm_config.rollout_correction
+        eps = algorithm_config.eps_clip
+        eps_high = algorithm_config.eps_clip_high
+        loss_fn_name = algorithm_config.loss_fn or "grpo"
+
+        is_config = ISConfig(
+            eps_clip=eps,
+            eps_clip_high=eps_high,
+            tis_cap=rc.tis_cap,
+            tis_level=rc.mode or "token",
+        )
+        dapo_config = DAPOConfig(
+            eps_clip=eps,
+            eps_clip_high=eps_high if eps_high is not None else 0.28,
+        )
+        gspo_config = GSPOConfig(
+            clip_ratio=eps,
+            clip_ratio_high=eps_high,
+            kl_beta=algorithm_config.kl_beta,
+        )
+        cispo_config = CISPOConfig(
+            eps_low=eps,
+            eps_high=eps_high if eps_high is not None else 0.28,
+        )
+
+        builder = build_loss_fn(
+            policy_loss=loss_fn_name,
+            kl_beta=algorithm_config.kl_beta,
+            dapo_config=dapo_config,
+            gspo_config=gspo_config,
+            cispo_config=cispo_config,
+            is_config=is_config,
+        )
+        return builder(advantages, ref_logprobs, prompt_lens, inf_logprobs, prox_logprobs)
+
+    # ------------------------------------------------------------------
+    # Forward-backward
+    # ------------------------------------------------------------------
+
+    async def _build_loss_for_datums(
+        self,
+        datums: list[tinker.Datum],
+        algorithm_config: AlgorithmConfig,
+    ):
+        """Compute proximal/ref logprobs and build a Fireworks cookbook callable loss.
+
+        Fireworks always uses the cookbook callable path (``forward_backward_custom``
+        only accepts callables, not string loss names).
+
+        When ``bypass_mode=True`` (default), proximal logprobs are set to
+        inference logprobs (no extra forward pass, TIS weight = 1.0).
+        When ``bypass_mode=False``, a proximal forward pass is run for
+        3-policy / decoupled PPO with active TIS correction.
+        """
+        rc = algorithm_config.rollout_correction
+        inf_logprobs, prompt_lens = self._extract_inf_logprobs_and_prompt_lens(datums)
+        advantages = self._extract_scalar_advantages(datums)
+
+        # Proximal logprobs
+        if rc.bypass_mode:
+            prox_logprobs = inf_logprobs
+        else:
+            prox_logprobs = await self._compute_proximal_logprobs(datums)
+
+        # Reference logprobs
+        if algorithm_config.kl_beta > 0 and self.reference_client is not None:
+            stripped = [self._remove_mask(d) for d in datums]
+            if algorithm_config.router_replay:
+                stripped = [self._strip_routing_matrices(d) for d in stripped]
+            ref_logprobs = await self.compute_reference_logprobs(stripped)
+        else:
+            ref_logprobs = [[] for _ in datums]
+
+        return self._build_custom_loss(
+            algorithm_config, advantages, ref_logprobs, prompt_lens, inf_logprobs, prox_logprobs,
+        )
 
     @require_training_client
     async def forward_backward_from_trajectory_groups(
@@ -207,6 +367,9 @@ class FireworksPolicyTrainer:
         algorithm_config: AlgorithmConfig | None = None,
     ) -> tuple[list[tinker.Datum] | dict[str, list[tinker.Datum]], list[torch.Tensor], dict]:
         """Run forward-backward pass from trajectory groups.
+
+        Always uses the Fireworks cookbook callable loss path. Optionally runs
+        proximal and/or reference forward passes based on ``algorithm_config``.
 
         Args:
             trajectory_groups: List of TrajectoryGroup objects (already filtered/transformed).
@@ -224,19 +387,23 @@ class FireworksPolicyTrainer:
             algorithm_config=algorithm_config,
         )
 
-        fwd_bwd_futures = await self._get_forward_backward_futures(
-            training_datums=training_datums,
-            estimator_map=algorithm_config.estimator_map,
-            algorithm_config=algorithm_config,
+        loss_fn = await self._build_loss_for_datums(training_datums, algorithm_config)
+        prepared = [self._prepare_datum_for_custom_loss(d) for d in training_datums]
+
+        fwd_bwd_result = await asyncio.to_thread(
+            self.training_client.forward_backward_custom, prepared, loss_fn,
         )
 
-        fwd_bwd_results = await asyncio.gather(*[asyncio.to_thread(lambda f=fut: f.result()) for fut in fwd_bwd_futures])
-
         training_logprobs = []
-        for fwd_bwd_result in fwd_bwd_results:
-            for output in fwd_bwd_result.loss_fn_outputs:
-                logprobs = output["logprobs"].to_torch()
-                training_logprobs.append(logprobs)
+        for output in fwd_bwd_result.loss_fn_outputs:
+            logprobs = output["logprobs"].to_torch()
+            training_logprobs.append(logprobs)
+
+        # Merge remote fwd/bwd metrics (e.g. loss) into adv_metrics
+        if hasattr(fwd_bwd_result, "metrics") and fwd_bwd_result.metrics:
+            for k, v in fwd_bwd_result.metrics.items():
+                if k not in self._METRIC_SKIP_KEYS:
+                    adv_metrics[f"train/{k}"] = v
 
         return training_datums, training_logprobs, adv_metrics
 
@@ -245,15 +412,18 @@ class FireworksPolicyTrainer:
     # ------------------------------------------------------------------
 
     @require_training_client
-    async def optim_step_future(
+    async def optim_step(
         self,
         step: int,
         total_steps: int,
         learning_rate: float,
         beta1: float = 0.9,
-        beta2: float = 0.95,
+        beta2: float = 0.999,
         eps: float = 1e-8,
-    ) -> tuple[Any, float]:
+        weight_decay: float = 0.01,
+        grad_clip_norm: float = 1.0,
+    ) -> tuple[float, dict]:
+        """Run optimizer step. Returns (scheduled_lr, metrics)."""
         scheduled_lr = learning_rate * compute_schedule_lr_multiplier(
             lr_schedule=self.algorithm_config.lr_schedule,
             warmup_steps_ratio=self.algorithm_config.warmup_steps_ratio,
@@ -266,88 +436,38 @@ class FireworksPolicyTrainer:
             beta1=beta1,
             beta2=beta2,
             eps=eps,
+            weight_decay=weight_decay,
+            grad_clip_norm=grad_clip_norm,
         )
-        future = self.training_client.optim_step(adam_params)
-        return future, scheduled_lr
+        optim_result = await asyncio.to_thread(self.training_client.optim_step, adam_params)
 
-    @require_training_client
-    async def fused_forward_backward_and_optim_step(
-        self,
-        step: int,
-        total_steps: int,
-        trajectory_groups: list[TrajectoryGroup],
-        learning_rate: float,
-        beta1: float = 0.9,
-        beta2: float = 0.95,
-        eps: float = 1e-8,
-    ) -> tuple[list[tinker.Datum] | dict[str, list[tinker.Datum]], list[torch.Tensor], dict, float]:
-        """Run forward-backward and optimizer step overlapped."""
-        training_datums, adv_metrics = transform_trajectory_groups_to_datums(
-            trajectory_groups,
-            algorithm_config=self.algorithm_config,
-        )
+        metrics = {}
+        if hasattr(optim_result, "metrics") and optim_result.metrics:
+            for k, v in optim_result.metrics.items():
+                if k not in self._METRIC_SKIP_KEYS:
+                    metrics[f"train/{k}"] = v
 
-        fwd_bwd_futures = await self._get_forward_backward_futures(
-            training_datums=training_datums,
-            estimator_map=self.algorithm_config.estimator_map,
-            algorithm_config=self.algorithm_config,
-        )
-
-        optim_future, scheduled_lr = await self.optim_step_future(
-            step=step,
-            total_steps=total_steps,
-            learning_rate=learning_rate,
-            beta1=beta1,
-            beta2=beta2,
-            eps=eps,
-        )
-
-        # Wait for all futures together
-        fwd_bwd_results = await asyncio.gather(*[asyncio.to_thread(lambda f=fut: f.result()) for fut in fwd_bwd_futures])
-        await asyncio.to_thread(lambda: optim_future.result())
-
-        training_logprobs = []
-        for fwd_bwd_result in fwd_bwd_results:
-            for output in fwd_bwd_result.loss_fn_outputs:
-                logprobs = output["logprobs"].to_torch()
-                training_logprobs.append(logprobs)
-
-        return training_datums, training_logprobs, adv_metrics, scheduled_lr
+        return scheduled_lr, metrics
 
     # ------------------------------------------------------------------
     # Checkpointing
     # ------------------------------------------------------------------
 
     @require_training_client
-    async def save_checkpoint_and_sync_weights(
-        self,
-        step: int,
-        save_dcp: bool = False,
-    ) -> None:
-        """Save sampler weights, hot-load into deployment, and optionally save a DCP checkpoint.
-
-        After hot-load completes the existing ``DeploymentSampler`` will
-        automatically serve the updated weights on its next request — no
-        new sampler object is needed.
-
-        Args:
-            step: Current global step.
-            save_dcp: Whether to also save a persistent DCP checkpoint.
-        """
-        name = f"step-{step}"
-
-        if save_dcp:
-            await asyncio.to_thread(lambda: self.training_client.inner.save_state(name).result(timeout=1800))
-            logger.info("DCP checkpoint saved: %s", name)
-
-        await self._sync_weights(name)
+    async def sync_weights(self, step: int) -> None:
+        """Hot-load current weights into the inference deployment."""
+        await self._sync_weights(f"step-{step}")
 
     @require_training_client
     async def save_dcp_checkpoint(self, step: int) -> None:
-        """Save a DCP (distributed checkpoint) only, without hot-loading."""
+        """Save a DCP checkpoint via WeightSyncer (includes dcp_timeout)."""
         name = f"step-{step}"
-        await asyncio.to_thread(lambda: self.training_client.inner.save_state(name).result(timeout=1800))
-        logger.info("DCP checkpoint saved: %s", name)
+        try:
+            await asyncio.to_thread(self.weight_syncer.save_dcp, name)
+            logger.info("DCP checkpoint saved: %s", name)
+        except Exception:
+            logger.exception("Failed to save DCP checkpoint %s", name)
+            raise
 
     # ------------------------------------------------------------------
     # Reference log-probs
@@ -368,5 +488,5 @@ class FireworksPolicyTrainer:
         if self.reference_client is None:
             raise RuntimeError("reference_client not set")
 
-        ref_fwd = await asyncio.to_thread(lambda: self.reference_client.forward(datums, "cross_entropy").result())
+        ref_fwd = await asyncio.to_thread(self.reference_client.forward, datums, "cross_entropy")
         return [out["logprobs"].data for out in ref_fwd.loss_fn_outputs]

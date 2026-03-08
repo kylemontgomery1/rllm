@@ -499,7 +499,7 @@ class AgentTrainer:
         train_dataset: Dataset | None = None,
         val_dataset: Dataset | None = None,
         workflow_args: dict | None = None,
-        backend: Literal["verl", "tinker"] = "verl",
+        backend: Literal["verl", "tinker", "fireworks"] = "verl",
         **kwargs,
     ):
         if backend == "verl":

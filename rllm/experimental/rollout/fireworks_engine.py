@@ -47,17 +47,19 @@ class _SampledSequenceAdapter:
     exposes the same ``.tokens``, ``.logprobs``, ``.stop_reason`` interface
     that ``tinker.SampledSequence`` (``TinkerTokenOutput``) provides."""
 
-    __slots__ = ("tokens", "logprobs", "stop_reason")
+    __slots__ = ("tokens", "logprobs", "stop_reason", "routing_matrices")
 
     def __init__(
         self,
         tokens: list[int],
         logprobs: list[float] | None,
         stop_reason: str | None,
+        routing_matrices: list[str] | None = None,
     ):
         self.tokens = tokens
         self.logprobs = logprobs
         self.stop_reason = stop_reason
+        self.routing_matrices = routing_matrices
 
 
 class FireworksEngine(TinkerEngine):
@@ -80,19 +82,15 @@ class FireworksEngine(TinkerEngine):
         disable_thinking: bool = False,
         accumulate_reasoning: bool = False,
         reasoning_effort: str = "medium",
+        sample_timeout: int = 600,
         processor=None,
+        router_replay: bool = False,
         **kwargs,
     ):
         """
         Args:
             tokenizer: HuggingFace tokenizer for chat-template rendering.
-            sampler: Pre-built ``DeploymentSampler``.  When provided,
-                ``inference_url`` / ``model`` / ``api_key`` are ignored.
-            inference_url: Fireworks inference base URL (used only when
-                *sampler* is ``None``).
-            model: Fully-qualified model / deployment name (used only when
-                *sampler* is ``None``).
-            api_key: Fireworks API key (used only when *sampler* is ``None``).
+            sampler: Pre-built ``DeploymentSampler``.
             max_prompt_length: Hard cap on prompt token length.
             max_response_length: Default max completion tokens.
             max_model_length: Total context window.
@@ -101,7 +99,10 @@ class FireworksEngine(TinkerEngine):
             disable_thinking: Suppress thinking tokens in the prompt.
             accumulate_reasoning: Accumulate reasoning across turns.
             reasoning_effort: Reasoning effort hint for the parser.
+            sample_timeout: HTTP timeout (seconds) for sampling calls.
             processor: Optional ``ProcessorMixin`` for multimodal models.
+            router_replay: If True, request and propagate routing matrices
+                for Router Replay (R3) training.
         """
         from rllm.experimental.rollout.rollout_engine import RolloutEngine
         from rllm.parser import ChatTemplateParser
@@ -125,25 +126,14 @@ class FireworksEngine(TinkerEngine):
         self.train_sampling_params = dict((sampling_params or {}).get("train", {}))
         self.val_sampling_params = dict((sampling_params or {}).get("val", {}))
 
-        # Not used by Fireworks, but kept so inherited helpers don't blow up
-        self.service_client = None
-        self.renderer = None
-
         # Chat template parser (same setup as TinkerEngine bypass mode)
         self.chat_parser = ChatTemplateParser.get_parser(
             tokenizer, processor=processor, disable_thinking=disable_thinking,
         )
-        if hasattr(self.chat_parser, "stop_sequences") and self.chat_parser.stop_sequences:
-            self.stop_sequences = self.chat_parser.stop_sequences
-        elif hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id:
-            self.stop_sequences = [tokenizer.eos_token_id]
-        else:
-            raise ValueError("No stop sequences found for tokenizer or chat parser")
 
-        # DeploymentSampler — accept a pre-built instance
-        self.sampler = sampler
-        # Store as sampling_client so inherited set_sampling_client / guards work
-        self.sampling_client = self.sampler
+        self.sample_timeout = sample_timeout
+        self.router_replay = router_replay
+        self.sampling_client = sampler
 
     # ------------------------------------------------------------------
     # Token-in / token-out override
@@ -152,6 +142,9 @@ class FireworksEngine(TinkerEngine):
     @property
     def supports_token_in_token_out(self) -> bool:
         return True
+
+    async def compute_logprobs(self, ids: list[int]) -> list[float]:
+        raise NotImplementedError("compute_logprobs is not supported by FireworksEngine.")
 
     @override
     async def get_token_output_from_token_input(
@@ -189,6 +182,9 @@ class FireworksEngine(TinkerEngine):
             if key in kwargs:
                 sampling_params[key] = kwargs[key]
 
+        if self.router_replay:
+            sampling_params["include_routing_matrix"] = True
+
         raw = await asyncio.to_thread(
             self._completions_with_retry,
             prompt_ids,
@@ -200,6 +196,7 @@ class FireworksEngine(TinkerEngine):
         completion_ids: list[int] = list((choice.get("raw_output") or {}).get("completion_token_ids") or [])
 
         logprobs: list[float] | None = None
+        content: list[dict] | None = None
         lp_data = choice.get("logprobs")
         if lp_data and isinstance(lp_data, dict):
             content = lp_data.get("content")
@@ -208,10 +205,30 @@ class FireworksEngine(TinkerEngine):
 
         finish_reason = choice.get("finish_reason", "stop")
 
+        routing_matrices = None
+        if self.router_replay and content:
+            matrices = [tok.get("routing_matrix", "") for tok in content]
+            if any(matrices):
+                routing_matrices = matrices
+            else:
+                logger.debug("router_replay enabled but API returned no routing matrices")
+
+        if logprobs is not None and len(logprobs) != len(completion_ids):
+            logger.warning(
+                "Length mismatch: %d logprobs vs %d completion tokens",
+                len(logprobs), len(completion_ids),
+            )
+        if routing_matrices is not None and len(routing_matrices) != len(completion_ids):
+            logger.warning(
+                "Length mismatch: %d routing matrices vs %d completion tokens",
+                len(routing_matrices), len(completion_ids),
+            )
+
         return _SampledSequenceAdapter(  # type: ignore[return-value]
             tokens=completion_ids,
             logprobs=logprobs,
             stop_reason=finish_reason,
+            routing_matrices=routing_matrices,
         )
 
     # ------------------------------------------------------------------
@@ -227,13 +244,14 @@ class FireworksEngine(TinkerEngine):
         """Call ``DeploymentSampler.completions`` with transient-error retries."""
         for attempt in range(_MAX_SAMPLE_ATTEMPTS):
             try:
-                return self.sampler.completions(
+                return self.sampling_client.completions(
                     prompt=prompt_ids,
                     n=1,
                     max_tokens=max_tokens,
                     raw_output=True,
                     logprobs=True,
                     top_logprobs=1,
+                    http_timeout=self.sample_timeout,
                     **sampling_kwargs,
                 )
             except Exception as exc:
@@ -250,13 +268,6 @@ class FireworksEngine(TinkerEngine):
                     )
                     time.sleep(wait)
                     continue
-                logger.error(
-                    "Sampling failed permanently after %d attempts: %s",
-                    attempt + 1,
-                    exc,
-                )
-                raise
-        raise RuntimeError("unreachable")
                 logger.error(
                     "Sampling failed permanently after %d attempts: %s",
                     attempt + 1,

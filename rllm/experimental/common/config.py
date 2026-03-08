@@ -86,6 +86,26 @@ class RejectionSamplingConfig:
     min_partial_solve_tasks: int = 1
 
 
+@dataclass
+class RolloutCorrectionConfig:
+    """Configuration for rollout correction (TIS, proximal forward passes).
+
+    Backend-agnostic — each backend interprets these according to its infrastructure.
+
+    Attributes:
+        mode: None = disabled (string loss names, current behavior).
+              "token" or "sequence" = enable custom callable loss with TIS at that level.
+        bypass_mode: When True, use rollout (inference) logprobs as π_old — no
+              proximal forward pass. When False, compute π_old via policy.forward()
+              (3-policy / decoupled PPO).
+        tis_cap: Upper clamp on the TIS importance weight.
+    """
+
+    mode: str | None = None
+    bypass_mode: bool = True
+    tis_cap: float = 5.0
+
+
 class rLLMAdvantageEstimator(str, Enum):
     """
     A unified advantage estimator for rLLM. Work with both `tinker` and `verl` backends at the expense of
@@ -119,9 +139,16 @@ class AlgorithmConfig:
     # When False (default), always compute advantages normally.
     use_precomputed_advantage: bool = False
     # for tinker backend only
-    loss_fn: Literal["importance_sampling", "ppo", "cispo", "dro", "cross_entropy"] | None = None
+    loss_fn: Literal["importance_sampling", "ppo", "cispo", "dro", "cross_entropy", "grpo", "dapo", "gspo"] | None = None
     lr_schedule: Literal["linear", "cosine", "constant"] = "constant"
     warmup_steps_ratio: float = 0.0
+
+    # Custom loss / rollout correction fields (used by Fireworks backend with cookbook losses)
+    kl_beta: float = 0.0
+    eps_clip: float = 0.2
+    eps_clip_high: float | None = None
+    rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    router_replay: bool = False
 
     @classmethod
     def from_config(cls, config: DictConfig) -> "AlgorithmConfig":
@@ -132,6 +159,12 @@ class AlgorithmConfig:
         Returns:
             AlgorithmConfig: The AlgorithmConfig built from the configuration.
         """
+        rc_section = config.rllm.algorithm.get("rollout_correction", {})
+        rollout_correction = RolloutCorrectionConfig(
+            mode=rc_section.get("mode", None),
+            bypass_mode=rc_section.get("bypass_mode", True),
+            tis_cap=rc_section.get("tis_cap", 5.0),
+        )
         return cls(
             estimator=rLLMAdvantageEstimator(config.algorithm.adv_estimator),
             stepwise_advantage_mode=config.rllm.stepwise_advantage.mode,
@@ -141,6 +174,11 @@ class AlgorithmConfig:
             loss_fn=config.rllm.algorithm.get("loss_fn", None),
             lr_schedule=config.rllm.algorithm.get("lr_schedule", "constant"),
             warmup_steps_ratio=config.rllm.algorithm.get("warmup_steps_ratio", 0.0),
+            kl_beta=config.rllm.algorithm.get("kl_beta", 0.0),
+            eps_clip=config.rllm.algorithm.get("eps_clip", 0.2),
+            eps_clip_high=config.rllm.algorithm.get("eps_clip_high", None),
+            rollout_correction=rollout_correction,
+            router_replay=config.rllm.algorithm.get("router_replay", False),
         )
 
     def __post_init__(self):

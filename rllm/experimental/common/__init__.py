@@ -9,6 +9,7 @@ from rllm.experimental.common.config import (
     AlgorithmConfig,
     CompactFilteringConfig,
     RejectionSamplingConfig,
+    RolloutCorrectionConfig,
     TransformConfig,
     rLLMAdvantageEstimator,
 )
@@ -26,6 +27,7 @@ __all__ = [
     # Config
     "CompactFilteringConfig",
     "RejectionSamplingConfig",
+    "RolloutCorrectionConfig",
     "TransformConfig",
     "AlgorithmConfig",
     # Transform pipeline

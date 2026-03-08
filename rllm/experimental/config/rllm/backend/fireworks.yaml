@@ -5,51 +5,56 @@
 # Unified configuration supporting both workflow and agent training modes
 
 # Fireworks-specific settings
-fireworks_base_url: "https://api.fireworks.ai"  # Fireworks service URL (null for local)
-fuse_forward_backward_and_optim_step: false
+fireworks_base_url: "https://api.fireworks.ai"  # Fireworks service URL
 
 display_name: "rl-trainer"  # Display name for the training job in Fireworks dashboard
-account: "rllm-project"
-fireworks_base_url: "https://api.fireworks.ai"  # Fireworks service URL
+account: null  # Fireworks account ID (falls back to FIREWORKS_ACCOUNT_ID env var)
 
 # Model Configuration
 model:
-  name: accounts/fireworks/models/qwen3-30b-a3b-instruct-2507  # Default model for DeepResearch
+  name: accounts/fireworks/models/qwen3-4b
   lora_rank: 0         # LoRA rank 0 means no LoRA fine-tuning, which is compatible with Fireworks backend
 
 # Training Configuration (fireworks-specific)
 training:
-  group_size: ???  # Number of rollouts per prompt (for GRPO)
-  learning_rate: 2e-5  # 2e-5 for MATH dataset
-  lr_schedule: "cosine"  # "constant", "linear", "cosine"
-  warmup_steps_ratio: 0.0  # Warmup steps as ratio of total steps (between 0 and 1)
-  # below are the Adam optimizer parameters
+  group_size: ???  # Number of rollouts per prompt
+  learning_rate: 2e-5
   beta1: 0.9
-  beta2: 0.95
+  beta2: 0.999
   eps: 1e-8
-  max_length: 32768
-
-  max_samples_per_fwd_bwd: 4  # Maximum number of samples (prompts x completions) per forward/backward pass
-  min_samples_per_fwd_bwd: 4  # Minimum number of samples per forward/back
-  completions_per_prompt: 4  # Number of completions to generate per prompt, used to calculate samples per fwd/bwd
-
-  default_local_dir: '/tmp/rllm-tinker-checkpoints'
-  resume_from_tinker_id: null  # Tinker model ID path to resume from (e.g., tinker://uuid/weights/000060)
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  max_length: null  # Auto-derived from training shape if null
 
 deployment:
-  deployment_id: qwen3-30b-instruct-deepmath-v4
-  deployment_shape: accounts/pyroworks-dev/deploymentShapes/rft-qwen3-30b-a3b-instruct-r3
-  tokenizer_model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  deployment_id: qwen3-4b-rllm
+  deployment_shape: null  # Auto-derived from training shape if null
+  deployment_region: null          # Region for deployment; falls back to training_infra.region
+  deployment_accelerator_type: null  # Accelerator for deployment; falls back to training_infra.accelerator_type
+  hot_load_bucket_type: FW_HOSTED  # Bucket type for hot-load snapshots
+  deployment_timeout_s: 5400       # Timeout for deployment creation/readiness (90 min)
+  deployment_extra_args: null      # Extra Helm args for the deployment
+  tokenizer_model: Qwen/Qwen3-4B
+  sample_timeout: 600              # HTTP read timeout for sampling completions (10 min)
+  disable_speculative_decoding: true  # Disable EAGLE speculation for hotload compatibility
+  extra_values: null               # Extra Helm values dict (e.g. {"priorityClass": "deployment"})
 
 hotload:
-  hot_load_interval: 1
-  first_checkpoint_type: base
-  hot_load_before_training: true
-  hot_load_timeout: 600
+  hot_load_interval: 1             # Sync weights to deployment every N steps (0 = disabled)
+  hot_load_timeout: 600            # Timeout for hotload_and_wait (seconds)
+  hot_load_before_training: false  # Push initial weights to deployment before first step
+  dcp_timeout: 2700                # Timeout for DCP save_state / load_state_with_optimizer (45 min)
 
 training_infra:
-  training_shape_id: ts-qwen3-30b-a3b-instruct-policy
-  region: US_OHIO_1
+  training_shape_id: qwen3-4b-minimum-h200
+  ref_training_shape_id: null      # Shape for reference trainer; falls back to training_shape_id
+  region: null
+  custom_image_tag: null           # Custom Docker image tag
+  accelerator_type: null           # GPU type (auto-resolved from training shape)
+  accelerator_count: null          # Number of GPUs (auto-resolved from training shape)
+  skip_validations: false          # Skip control plane training shape validations
+  node_count: 1                    # Number of training nodes
+  extra_args: null                 # Extra CLI args for the trainer job
 
 # Validation Configuration
 validation:
@@ -66,23 +71,11 @@ sampling:
     top_p: 1.0
     top_k: -1
 
-# Workflow Configuration (for workflow training mode)
-workflow:
-  n_parallel_tasks: 256
-  retry_limit: 3
-
-# Agent Configuration (for agent training mode)
-agent:
-  max_steps: 1  # Single-turn vs multi-turn
-  agent_args: {}
-
-# Tinker Engine Configuration
+# Rollout Engine Configuration
 rollout_engine:
   reasoning_effort: "medium"
   accumulate_reasoning: false
   disable_thinking: false
-  bypass_render_with_parser: false
-  renderer_name: null
 
 # Data Configuration
 data:
