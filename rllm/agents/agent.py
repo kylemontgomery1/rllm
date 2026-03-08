@@ -132,7 +132,7 @@ class Step:
             reward=data["reward"],
             done=data["done"],
             mc_return=data["mc_return"],
-            advantage=data["advantage"],
+            advantage=data.get("advantage", 0.0),
         )
 
     @classmethod

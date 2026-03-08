@@ -890,6 +890,11 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
             recipient = message.recipient
 
             if recipient:
+                VALID_CHANNELS = {"analysis", "final", "commentary"}
+                if channel and channel not in VALID_CHANNELS:
+                    recipient = channel
+                    is_builtin = recipient.startswith(("browser", "python"))
+                    channel = "analysis" if is_builtin else "commentary"
                 try:
                     arguments = json5.loads(text) if text.strip() else {}
                     tool_calls.append(ToolCall(name=recipient, arguments=arguments))

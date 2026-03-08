@@ -58,6 +58,7 @@ class vLLMEngine(RolloutEngine):
         tp: int = 8,
         num_replicas: int = 1,
         gpus_per_node: int = 8,
+        gpu_memory_utilization: float = 0.9,
         tokenizer=None,
         processor=None,
         chat_parser=None,
@@ -75,7 +76,7 @@ class vLLMEngine(RolloutEngine):
             chat_parser: Optional chat parser (auto-created from tokenizer if None)
             **kwargs: Additional arguments passed to __init__
         """
-        server_handles = await start_server(model_path, tp, num_replicas, gpus_per_node)
+        server_handles = await start_server(model_path, tp, num_replicas, gpus_per_node, gpu_memory_utilization)
 
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -166,7 +167,7 @@ class vLLMEngine(RolloutEngine):
         )
 
 
-async def start_server(model_path: str, tp: int = 8, num_replicas: int = 1, gpus_per_node: int = 8) -> list:
+async def start_server(model_path: str, tp: int = 8, num_replicas: int = 1, gpus_per_node: int = 8, gpu_memory_utilization: float = 0.9) -> list:
     """Start vLLM server(s)."""
     if not ray.is_initialized():
         ray.init()
@@ -177,7 +178,7 @@ async def start_server(model_path: str, tp: int = 8, num_replicas: int = 1, gpus
         name="vllm",
         load_format="auto",
         tensor_model_parallel_size=tp,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=False,
         enable_sleep_mode=False,
         free_cache_engine=False,
