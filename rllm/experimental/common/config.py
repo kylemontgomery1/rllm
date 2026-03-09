@@ -14,21 +14,28 @@ class AsyncTrainingConfig:
 
     When `enabled` is False, the trainer uses the current synchronous pipeline.
     When `enabled` is True, the trainer runs concurrent generation + training
-    with episode-level streaming and staleness-based filtering.
+    with group-level streaming and dispatch-time throttle.
 
-    Behavior spectrum (following the Verl fully-async pattern):
-        - staleness_threshold=0, trigger_parameter_sync_step=1: On-policy (panel a)
-        - staleness_threshold=0, trigger_parameter_sync_step=K: Stream off-policy (panel b)
-        - staleness_threshold>0, partial_rollout=False: Async with staleness (panel c)
-        - staleness_threshold>0, partial_rollout=True: Async with partial rollout (panel d)
+    Behavior spectrum:
+        - staleness_threshold=0, trigger_parameter_sync_step=1: On-policy
+        - staleness_threshold=0, trigger_parameter_sync_step=K: Stream off-policy
+        - staleness_threshold>0, partial_rollout=False: Async with staleness
+        - staleness_threshold>0, partial_rollout=True: Async with partial rollout
     """
 
     enabled: bool = False
-    staleness_threshold: float = 0.0  # 0.0 = on-policy. Fraction of extra samples allowed.
-    trigger_parameter_sync_step: int = 1  # gradient updates between weight syncs
-    partial_rollout: bool = True  # True = don't wait for in-flight to finish at sync
-    num_minibatches: int = 1  # gradient accumulation within a training step
-    requeue_stale: bool = True  # re-schedule stale episodes' tasks for generation
+    mini_batch_size: int = 1            # episode groups per optimizer step
+    streaming_chunks: int = 1           # forward-backward passes per optimizer step (must divide mini_batch_size)
+    staleness_threshold: float = 0.0    # 0.0 = on-policy. Controls dispatch throttle quota.
+    trigger_parameter_sync_step: int = 1  # optimizer steps between weight sync + version bump
+    partial_rollout: bool = True        # enable turn-level gating during weight sync
+
+    def __post_init__(self):
+        if self.enabled:
+            assert self.streaming_chunks >= 1
+            assert self.mini_batch_size % self.streaming_chunks == 0, (
+                f"mini_batch_size ({self.mini_batch_size}) must be divisible by streaming_chunks ({self.streaming_chunks})"
+            )
 
 
 @dataclass
@@ -107,6 +114,10 @@ class RejectionSamplingConfig:
 
     # For "episode" mode (verl compatibility): minimum number of tasks with partial solves before proceeding
     min_partial_solve_tasks: int = 1
+
+    # Filter out episode groups where all rollouts have the same is_correct (no gradient signal).
+    # Applied at the accumulator level in async training, before groups enter the buffer.
+    filter_uniform_groups: bool = False
 
 
 @dataclass

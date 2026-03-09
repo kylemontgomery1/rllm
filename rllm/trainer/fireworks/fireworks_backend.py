@@ -79,6 +79,8 @@ class FireworksBackend(TinkerBackend):
         self.sampling_client: DeploymentSampler | None = None
         self._algorithm_config = None
 
+        self._policy_updated_this_step: bool = False
+
         self.learning_rate = config.training.get("learning_rate", 1e-6)
         self.beta1 = config.training.get("beta1", 0.9)
         self.beta2 = config.training.get("beta2", 0.95)
@@ -357,23 +359,35 @@ class FireworksBackend(TinkerBackend):
         logger.info("Saving final DCP checkpoint at step %d", trainer_state.global_step)
         await self.policy_trainer.save_dcp_checkpoint(trainer_state.global_step)
 
+    async def on_policy_updated(self, trainer_state: TrainerState) -> None:
+        assert self.policy_trainer is not None
+        self._policy_updated_this_step = True
+
+        global_step = trainer_state.global_step
+        save_freq = self.full_config.rllm.trainer.save_freq
+
+        if save_freq > 0 and global_step % save_freq == 0:
+            await self.policy_trainer.save_dcp_checkpoint(global_step)
+
+        await self.policy_trainer.sync_weights(global_step)
+
     async def on_batch_end(self, trainer_state: TrainerState) -> None:
         assert self.policy_trainer is not None, "policy_trainer is not initialized"
 
         global_step = trainer_state.global_step
-        save_freq = self.full_config.rllm.trainer.save_freq
-        save_dcp = save_freq > 0 and global_step % save_freq == 0
-        hot_load_interval = self.full_config.hotload.get("hot_load_interval", 1)
-        should_hotload = hot_load_interval > 0 and global_step % hot_load_interval == 0
 
-        if save_dcp:
-            with simple_timer("save_checkpoint", trainer_state.timing_dict):
-                await self.policy_trainer.save_dcp_checkpoint(global_step)
+        # In async mode, on_policy_updated already handled checkpoint + hotload
+        if not self._policy_updated_this_step:
+            save_freq = self.full_config.rllm.trainer.save_freq
+            if save_freq > 0 and global_step % save_freq == 0:
+                with simple_timer("save_checkpoint", trainer_state.timing_dict):
+                    await self.policy_trainer.save_dcp_checkpoint(global_step)
 
-        if should_hotload:
-            with simple_timer("sync_weights", trainer_state.timing_dict):
-                logger.info("Syncing weights to deployment at step %d", global_step)
-                await self.policy_trainer.sync_weights(global_step)
+            hot_load_interval = self.full_config.hotload.get("hot_load_interval", 1)
+            if hot_load_interval > 0 and global_step % hot_load_interval == 0:
+                with simple_timer("sync_weights", trainer_state.timing_dict):
+                    await self.policy_trainer.sync_weights(global_step)
+        self._policy_updated_this_step = False
 
         learning_rate = trainer_state.extra_info.get("scheduled_learning_rate", self.learning_rate)
         update_training_metrics(trainer_state, learning_rate, trainer_state.total_steps)

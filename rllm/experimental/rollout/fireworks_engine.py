@@ -25,6 +25,7 @@ from fireworks.training.sdk import DeploymentSampler
 
 from typing_extensions import override
 
+from rllm.experimental.rollout.rollout_engine import ModelOutput
 from rllm.experimental.rollout.tinker_engine import (
     TinkerEngine,
     _flat_token_input_length,
@@ -134,6 +135,20 @@ class FireworksEngine(TinkerEngine):
         self.sample_timeout = sample_timeout
         self.router_replay = router_replay
         self.sampling_client = sampler
+
+    # ------------------------------------------------------------------
+    # Gate-aware model response
+    # ------------------------------------------------------------------
+
+    @override
+    async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
+        await self.wait_for_gate()
+        try:
+            result = await super().get_model_response(messages, **kwargs)
+            result.weight_version = self.weight_version
+            return result
+        finally:
+            self.on_model_call_complete()
 
     # ------------------------------------------------------------------
     # Token-in / token-out override

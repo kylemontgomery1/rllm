@@ -62,9 +62,13 @@ class Step:
     # TODO: potentially rename this as "advantages" so its clearer that it allows a generic list.
     advantage: list[float] | float | None = None
 
+    # weight version at time of generation (for async training staleness tracking)
+    weight_version: int | None = None
+
     def __post_init__(self):
         self.chat_completions = deepcopy(self.chat_completions)
         self.info = deepcopy(self.info)
+
         if self.model_output is None:
             return
         # backfill fields like prompt_ids, response_ids, logprobs, etc.
@@ -76,6 +80,8 @@ class Step:
             self.logprobs = self.model_output.logprobs
         if self.routing_matrices is None and getattr(self.model_output, 'routing_matrices', None) is not None:
             self.routing_matrices = self.model_output.routing_matrices
+        if self.weight_version is None and hasattr(self.model_output, 'weight_version'):
+            self.weight_version = self.model_output.weight_version
 
         # check that the token ids are filled
         # TODO(listar2000): this might cause compatibility issue. Double check if we should make these assertions.
@@ -115,6 +121,7 @@ class Step:
             "done": self.done,
             "mc_return": self.mc_return,
             "advantage": self.advantage,
+            "weight_version": self.weight_version,
         }
 
     @classmethod
@@ -136,6 +143,7 @@ class Step:
             done=data["done"],
             mc_return=data["mc_return"],
             advantage=data.get("advantage", 0.0),
+            weight_version=data.get("weight_version"),
         )
 
     @classmethod
