@@ -127,7 +127,7 @@ class RolloutCorrectionConfig:
     Backend-agnostic — each backend interprets these according to its infrastructure.
 
     Attributes:
-        mode: None = disabled (string loss names, current behavior).
+        tis_mode: None = disabled (string loss names, current behavior).
               "token" or "sequence" = enable custom callable loss with TIS at that level.
         bypass_mode: When True, use rollout (inference) logprobs as π_old — no
               proximal forward pass. When False, compute π_old via policy.forward()
@@ -135,7 +135,7 @@ class RolloutCorrectionConfig:
         tis_cap: Upper clamp on the TIS importance weight.
     """
 
-    mode: str | None = None
+    tis_mode: str | None = None
     bypass_mode: bool = True
     tis_cap: float = 5.0
 
@@ -195,7 +195,7 @@ class AlgorithmConfig:
         """
         rc_section = config.rllm.algorithm.get("rollout_correction", {})
         rollout_correction = RolloutCorrectionConfig(
-            mode=rc_section.get("mode", None),
+            tis_mode=rc_section.get("tis_mode", None),
             bypass_mode=rc_section.get("bypass_mode", True),
             tis_cap=rc_section.get("tis_cap", 5.0),
         )

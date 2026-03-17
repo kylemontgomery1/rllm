@@ -92,7 +92,7 @@ tinker = [
 ]
 
 fireworks = [
-    "fireworks-ai[training]>=1.0.0a36 ; python_version >= '3.11'",
+    "fireworks-ai[training] ; python_version >= '3.11'",
     "fireworks-training-cookbook @ git+https://github.com/fw-ai/cookbook.git#subdirectory=training ; python_version >= '3.11'",
 ]
 

@@ -29,6 +29,26 @@ from fireworks.training.sdk import (
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 
+# fix:fireworks - tinker 0.15.0 sends project_id=None, server rejects it
+from tinker.types import CreateSessionRequest
+_orig_model_dump = CreateSessionRequest.model_dump
+def _patched_model_dump(self, **kwargs):
+    result = _orig_model_dump(self, **kwargs)
+    if result.get("project_id") is None:
+        result.pop("project_id", None)
+    return result
+CreateSessionRequest.model_dump = _patched_model_dump
+
+# fix:fireworks - optim_step sends grad_accumulation_normalization via extra_body, server rejects it
+from fireworks.training.sdk.client import FiretitanTrainingClient
+from tinker.lib.public_interfaces.training_client import TrainingClient
+FiretitanTrainingClient.optim_step = TrainingClient.optim_step
+from training.utils.client import ReconnectableClient as _RC
+_orig_rc_optim_step = _RC.optim_step
+def _patched_rc_optim_step(self, params, grad_accumulation_normalization=None):
+    return self._client.optim_step(params).result(timeout=self._default_timeout)
+_RC.optim_step = _patched_rc_optim_step
+
 from rllm.experimental.common import simple_timer
 from rllm.experimental.rollout import FireworksEngine, RolloutEngine
 from rllm.trainer.fireworks.fireworks_policy_trainer import FireworksPolicyTrainer
@@ -112,7 +132,6 @@ class FireworksBackend(TinkerBackend):
             custom_image_tag=cfg_section.get("custom_image_tag"),
             accelerator_type=cfg_section.get("accelerator_type"),
             accelerator_count=cfg_section.get("accelerator_count"),
-            skip_validations=cfg_section.get("skip_validations", False),
             node_count=cfg_section.get("node_count", 1),
             extra_args=list(cfg_section.get("extra_args") or []),
         )
@@ -288,7 +307,7 @@ class FireworksBackend(TinkerBackend):
         loss_fn = alg.get("loss_fn", None)
         eps_clip_high = alg.get("eps_clip_high", None)
         rc = alg.get("rollout_correction", {})
-        rc_mode = rc.get("mode", None)
+        tis_mode = rc.get("tis_mode", None)
         bypass_mode = rc.get("bypass_mode", True)
 
         _FIREWORKS_COOKBOOK_LOSS_FNS = {"grpo", "dapo", "gspo", "cispo"}
@@ -306,18 +325,18 @@ class FireworksBackend(TinkerBackend):
                 loss_fn,
             )
 
-        # rollout_correction.mode validation
-        if rc_mode is not None and rc_mode not in ("token", "sequence"):
+        # rollout_correction.tis_mode validation
+        if tis_mode is not None and tis_mode not in ("token", "sequence"):
             raise ValueError(
-                f"rollout_correction.mode must be null, 'token', or 'sequence', got '{rc_mode}'"
+                f"rollout_correction.tis_mode must be null, 'token', or 'sequence', got '{tis_mode}'"
             )
 
         # TIS with bypass is a no-op (prox = inf → weight = 1.0)
-        if rc_mode is not None and bypass_mode:
+        if tis_mode is not None and bypass_mode:
             logger.warning(
-                "rollout_correction.mode='%s' with bypass_mode=true — TIS weight "
+                "rollout_correction.tis_mode='%s' with bypass_mode=true — TIS weight "
                 "will be 1.0 (no correction). Set bypass_mode=false for active TIS.",
-                rc_mode,
+                tis_mode,
             )
 
     # ------------------------------------------------------------------

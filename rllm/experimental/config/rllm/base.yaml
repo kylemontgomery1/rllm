@@ -69,8 +69,8 @@ algorithm:
 
   # Rollout correction: corrects FP8 (inference) vs FP32 (training) drift
   rollout_correction:
-    mode: null            # null = disabled, "token" or "sequence" = enable custom callable loss
     bypass_mode: true     # true = use rollout logprobs as pi_old (2-policy), false = proximal forward (3-policy)
+    tis_mode: null        # null = disabled, "token" or "sequence" = TIS importance sampling level
     tis_cap: 5.0          # Upper clamp on TIS importance weight
 
 # Stepwise advantage

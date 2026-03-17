@@ -129,7 +129,7 @@ class FireworksPolicyTrainer:
             The step to resume from, or 0 if no checkpoint was found.
         """
         inner = self.training_client.inner
-        checkpoints, _ = inner.list_checkpoints()
+        checkpoints = inner.list_checkpoints()
         if not checkpoints:
             logger.info("No existing checkpoints found.")
             return 0
@@ -292,7 +292,7 @@ class FireworksPolicyTrainer:
             eps_clip=eps,
             eps_clip_high=eps_high,
             tis_cap=rc.tis_cap,
-            tis_level=rc.mode or "token",
+            tis_level=rc.tis_mode or "token",
         )
         dapo_config = DAPOConfig(
             eps_clip=eps,

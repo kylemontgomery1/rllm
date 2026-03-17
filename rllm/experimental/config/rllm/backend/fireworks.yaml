@@ -6,6 +6,7 @@
 
 # Fireworks-specific settings
 fireworks_base_url: "https://api.fireworks.ai"  # Fireworks service URL
+fuse_forward_backward_and_optim_step: false  # Must be false for Fireworks backend
 
 display_name: "rl-trainer"  # Display name for the training job in Fireworks dashboard
 account: null  # Fireworks account ID (falls back to FIREWORKS_ACCOUNT_ID env var)
@@ -18,7 +19,7 @@ model:
 # Training Configuration (fireworks-specific)
 training:
   group_size: ???  # Number of rollouts per prompt
-  learning_rate: 2e-5
+  learning_rate: 1e-5
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -27,7 +28,7 @@ training:
   max_length: null  # Auto-derived from training shape if null
 
 deployment:
-  deployment_id: qwen3-4b-rllm
+  deployment_id: "rllm-${now:%Y%m%d-%H%M%S}"
   deployment_shape: null  # Auto-derived from training shape if null
   deployment_region: null          # Region for deployment; falls back to training_infra.region
   deployment_accelerator_type: null  # Accelerator for deployment; falls back to training_infra.accelerator_type
@@ -65,11 +66,11 @@ sampling:
   train:
     temperature: 1.0
     top_p: 1.0
-    top_k: -1
+    top_k: null
   val:
     temperature: 1.0
     top_p: 1.0
-    top_k: -1
+    top_k: null
 
 # Rollout Engine Configuration
 rollout_engine:
@@ -84,7 +85,7 @@ data:
   max_prompt_length: 2048
   max_response_length: 2048
   train_batch_size: 64
-  val_batch_size: 32
+  val_batch_size: -1
 
 # Overriding the rLLM-common config with Fireworks-specific ones
 # Only override if the algorithm values are not None, otherwise still use the rLLM-common config

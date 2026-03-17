@@ -164,6 +164,8 @@ class TinkerBackend(BackendProtocol[Iterable, list[tinker.Datum]]):
             shuffle = True
         else:
             batch_size = self.full_config.data.get("val_batch_size", self.full_config.data.train_batch_size)
+            if batch_size == -1:
+                batch_size = len(dataset)
             shuffle = False
 
         return torch.utils.data.DataLoader(

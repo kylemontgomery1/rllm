@@ -200,8 +200,7 @@ class FireworksEngine(TinkerEngine):
         if self.router_replay:
             sampling_params["include_routing_matrix"] = True
 
-        raw = await asyncio.to_thread(
-            self._completions_with_retry,
+        raw = await self._completions_with_retry(
             prompt_ids,
             max_tokens,
             sampling_params,
@@ -250,18 +249,17 @@ class FireworksEngine(TinkerEngine):
     # Internal retry helper
     # ------------------------------------------------------------------
 
-    def _completions_with_retry(
+    async def _completions_with_retry(
         self,
         prompt_ids: list[int],
         max_tokens: int,
         sampling_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
-        """Call ``DeploymentSampler.completions`` with transient-error retries."""
+        """Call ``DeploymentSampler.async_completions`` with transient-error retries."""
         for attempt in range(_MAX_SAMPLE_ATTEMPTS):
             try:
-                return self.sampling_client.completions(
+                return await self.sampling_client.async_completions(
                     prompt=prompt_ids,
-                    n=1,
                     max_tokens=max_tokens,
                     raw_output=True,
                     logprobs=True,
@@ -281,7 +279,7 @@ class FireworksEngine(TinkerEngine):
                         exc,
                         wait,
                     )
-                    time.sleep(wait)
+                    await asyncio.sleep(wait)
                     continue
                 logger.error(
                     "Sampling failed permanently after %d attempts: %s",
