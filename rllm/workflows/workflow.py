@@ -21,6 +21,7 @@ class TerminationReason(Enum):
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
     ERROR = "error"
+    FORMAT_ERROR = "format_error"
 
 
 class TerminationEvent(Exception):

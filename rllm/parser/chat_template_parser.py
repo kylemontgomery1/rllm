@@ -859,7 +859,7 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
                 raise NotImplementedError(f"Unsupported message role: {message['role']}")
 
         conv = Conversation.from_messages(harmony_messages)
-        accumulate_thinking = kwargs.get("accumulate_thinking", False)
+        accumulate_thinking = kwargs.get("accumulate_reasoning", kwargs.get("accumulate_thinking", False))
         config = RenderConversationConfig(auto_drop_analysis=not accumulate_thinking)
         prompt_ids: list[int] = self.enc.render_conversation(conv, config)
 
@@ -897,6 +897,8 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
                     channel = "analysis" if is_builtin else "commentary"
                 try:
                     arguments = json5.loads(text) if text.strip() else {}
+                    if not isinstance(arguments, dict):
+                        raise ValueError(f"parsed arguments is {type(arguments).__name__}, not dict")
                     tool_calls.append(ToolCall(name=recipient, arguments=arguments))
                 except Exception:
                     tool_calls.append(ToolCall(name=recipient, arguments={}, metadata={"raw_arguments": text}))

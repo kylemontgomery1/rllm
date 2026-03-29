@@ -134,7 +134,7 @@ class UnifiedTrainer:
         # Async training config
         async_cfg = self.rllm_config.get("async_training", {})
         self.async_config = AsyncTrainingConfig(
-            enabled=async_cfg.get("enabled", False),
+            enable=async_cfg.get("enable", False),
             mini_batch_size=async_cfg.get("mini_batch_size", 1),
             streaming_chunks=async_cfg.get("streaming_chunks", 1),
             staleness_threshold=async_cfg.get("staleness_threshold", 0.0),
@@ -264,7 +264,7 @@ class UnifiedTrainer:
     async def _fit_async(self, trainer_state: TrainerState) -> None:
         """Dispatch to sync or concurrent training based on config."""
         # TODO(listar2000): after some benchmarking, maybe we just keep the fully-async and treat on-policy as a special case.
-        if self.async_config.enabled:
+        if self.async_config.enable:
             await self._fit_fully_async(trainer_state)
         else:
             await self._fit_on_policy(trainer_state)
@@ -431,7 +431,7 @@ class UnifiedTrainer:
                     # async training uses train_batch_size=1
                     task = batch[0]
 
-                    # Block during validation / non-partial sync
+                    # Block during validation / weight sync (if partial_rollout is False)
                     await coordinator.wait_for_generation_allowed()
 
                     # Dispatch-time throttle: block if quota exhausted

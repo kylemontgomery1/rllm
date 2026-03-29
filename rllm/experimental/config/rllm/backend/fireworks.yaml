@@ -8,9 +8,6 @@
 fireworks_base_url: "https://api.fireworks.ai"  # Fireworks service URL
 fuse_forward_backward_and_optim_step: false  # Must be false for Fireworks backend
 
-display_name: "rl-trainer"  # Display name for the training job in Fireworks dashboard
-account: null  # Fireworks account ID (falls back to FIREWORKS_ACCOUNT_ID env var)
-
 # Model Configuration
 model:
   name: accounts/fireworks/models/qwen3-4b
@@ -28,7 +25,7 @@ training:
   max_length: null  # Auto-derived from training shape if null
 
 deployment:
-  deployment_id: "rllm-${now:%Y%m%d-%H%M%S}"
+  deployment_id: "rllm-deploy-${now:%Y%m%d-%H%M%S}"
   deployment_shape: null  # Auto-derived from training shape if null
   deployment_region: null          # Region for deployment; falls back to training_infra.region
   deployment_accelerator_type: null  # Accelerator for deployment; falls back to training_infra.accelerator_type
@@ -38,6 +35,7 @@ deployment:
   tokenizer_model: Qwen/Qwen3-4B
   sample_timeout: 600              # HTTP read timeout for sampling completions (10 min)
   disable_speculative_decoding: true  # Disable EAGLE speculation for hotload compatibility
+  replica_count: 1              # Pin deployment to a fixed replica count (null = 1)
   extra_values: null               # Extra Helm values dict (e.g. {"priorityClass": "deployment"})
 
 hotload:
@@ -45,6 +43,8 @@ hotload:
   hot_load_timeout: 600            # Timeout for hotload_and_wait (seconds)
   hot_load_before_training: false  # Push initial weights to deployment before first step
   dcp_timeout: 2700                # Timeout for DCP save_state / load_state_with_optimizer (45 min)
+  warmup_after_hotload: true       # Send warmup request after hotloading to prime caches
+  warmup_max_retries: 10           # Max retries for post-hotload warmup
 
 training_infra:
   training_shape_id: qwen3-4b-minimum-h200

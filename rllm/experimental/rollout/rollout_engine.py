@@ -22,6 +22,7 @@ class ModelOutput:
     completion_length: int = 0
     finish_reason: str | None = None
     weight_version: int | None = None  # policy version at time of generation
+    metrics: dict | None = None  # per-turn server metrics (e.g. ttft, queue durations)
 
     def to_dict(self):
         return {
@@ -114,6 +115,12 @@ class RolloutEngine:
     async def get_token_output_from_token_input(self, token_input: TokenInput, **kwargs) -> TokenOutput:
         """Obtain the token output from the given token input."""
         raise NotImplementedError("get_token_output_from_token_input is not implemented")
+
+    def acquire_session(self, request_id: str):
+        pass
+
+    def release_session(self, request_id: str):
+        pass
 
     async def wake_up(self):
         pass

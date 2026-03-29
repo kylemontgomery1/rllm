@@ -18,14 +18,13 @@ is inherited from ``TinkerEngine``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
-import time
 from typing import Any
 from fireworks.training.sdk import DeploymentSampler
 
 from typing_extensions import override
 
-from rllm.experimental.rollout.rollout_engine import ModelOutput
 from rllm.experimental.rollout.tinker_engine import (
     TinkerEngine,
     _flat_token_input_length,
@@ -48,7 +47,7 @@ class _SampledSequenceAdapter:
     exposes the same ``.tokens``, ``.logprobs``, ``.stop_reason`` interface
     that ``tinker.SampledSequence`` (``TinkerTokenOutput``) provides."""
 
-    __slots__ = ("tokens", "logprobs", "stop_reason", "routing_matrices")
+    __slots__ = ("tokens", "logprobs", "stop_reason", "routing_matrices", "server_metrics")
 
     def __init__(
         self,
@@ -56,11 +55,13 @@ class _SampledSequenceAdapter:
         logprobs: list[float] | None,
         stop_reason: str | None,
         routing_matrices: list[str] | None = None,
+        server_metrics: dict | None = None,
     ):
         self.tokens = tokens
         self.logprobs = logprobs
         self.stop_reason = stop_reason
         self.routing_matrices = routing_matrices
+        self.server_metrics = server_metrics
 
 
 class FireworksEngine(TinkerEngine):
@@ -137,20 +138,6 @@ class FireworksEngine(TinkerEngine):
         self.sampling_client = sampler
 
     # ------------------------------------------------------------------
-    # Gate-aware model response
-    # ------------------------------------------------------------------
-
-    @override
-    async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
-        await self.wait_for_gate()
-        try:
-            result = await super().get_model_response(messages, **kwargs)
-            result.weight_version = self.weight_version
-            return result
-        finally:
-            self.on_model_call_complete()
-
-    # ------------------------------------------------------------------
     # Token-in / token-out override
     # ------------------------------------------------------------------
 
@@ -193,14 +180,14 @@ class FireworksEngine(TinkerEngine):
         requested_max_tokens = sampling_params.pop("max_tokens", requested_max_tokens)
         max_tokens = self._prepare_max_tokens(requested_max_tokens, input_length)
 
-        for key in ("temperature", "top_p", "top_k"):
+        for key in ("temperature", "top_p", "top_k", "prompt_cache_isolation_key"):
             if key in kwargs:
-                sampling_params[key] = kwargs[key]
+                sampling_params[key] = kwargs.pop(key)
 
         if self.router_replay:
             sampling_params["include_routing_matrix"] = True
 
-        raw = await self._completions_with_retry(
+        raw, server_metrics = await self._completions_with_retry(
             prompt_ids,
             max_tokens,
             sampling_params,
@@ -243,6 +230,7 @@ class FireworksEngine(TinkerEngine):
             logprobs=logprobs,
             stop_reason=finish_reason,
             routing_matrices=routing_matrices,
+            server_metrics=server_metrics,
         )
 
     # ------------------------------------------------------------------
@@ -254,11 +242,13 @@ class FireworksEngine(TinkerEngine):
         prompt_ids: list[int],
         max_tokens: int,
         sampling_kwargs: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Call ``DeploymentSampler.async_completions`` with transient-error retries."""
+    ) -> tuple[dict[str, Any], dict | None]:
+        """Call ``DeploymentSampler.async_completions_stream`` with transient-error retries.
+
+        Returns (response_dict, server_metrics_dict)."""
         for attempt in range(_MAX_SAMPLE_ATTEMPTS):
             try:
-                return await self.sampling_client.async_completions(
+                result, server_metrics = await self.sampling_client.async_completions_stream(
                     prompt=prompt_ids,
                     max_tokens=max_tokens,
                     raw_output=True,
@@ -267,6 +257,11 @@ class FireworksEngine(TinkerEngine):
                     http_timeout=self.sample_timeout,
                     **sampling_kwargs,
                 )
+                metrics_dict = {
+                    k: v for k, v in dataclasses.asdict(server_metrics).items()
+                    if v is not None
+                } if server_metrics else None
+                return result, metrics_dict
             except Exception as exc:
                 err = str(exc)
                 transient = any(code in err for code in _TRANSIENT_ERROR_CODES)

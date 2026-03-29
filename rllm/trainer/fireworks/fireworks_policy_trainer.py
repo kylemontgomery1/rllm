@@ -59,33 +59,23 @@ class FireworksPolicyTrainer:
         self,
         config,
         training_client: ReconnectableClient,
-        reference_client: ReconnectableClient | None = None,
         weight_syncer: WeightSyncer | None = None,
         cf_config: CompactFilteringConfig | None = None,
         transform_config: TransformConfig | None = None,
         algorithm_config: AlgorithmConfig | None = None,
+        rlor_mgr=None,
+        policy_job_id: str | None = None,
     ):
-        """
-        Args:
-            config: Training configuration (OmegaConf).
-            training_client: ``ReconnectableClient`` wrapping the policy
-                ``FiretitanTrainingClient``.
-            reference_client: Optional ``ReconnectableClient`` for the
-                reference model (KL penalty, etc.).
-            weight_syncer: ``WeightSyncer`` for pushing checkpoints to
-                the inference deployment.
-            cf_config: Compact filtering configuration.
-            transform_config: Transform configuration.
-            algorithm_config: Algorithm configuration.
-        """
         self.config = config
         self.training_client = training_client
-        self.reference_client = reference_client
         self.weight_syncer = weight_syncer
+        self._rlor_mgr = rlor_mgr
+        self._policy_job_id = policy_job_id
 
         self.cf_config = cf_config or CompactFilteringConfig.from_config(self.config.rllm.compact_filtering)
         self.transform_config = transform_config or TransformConfig()
         self.algorithm_config = algorithm_config or AlgorithmConfig.from_config(self.config)
+        self.resolve_builtin_loss(self.algorithm_config)
 
     # ------------------------------------------------------------------
     # Initialization
@@ -152,102 +142,60 @@ class FireworksPolicyTrainer:
         """Push initial base weights to the inference deployment."""
         await self._sync_weights("step-0-base", checkpoint_type="base")
 
-    async def _sync_weights(self, name: str, checkpoint_type: str | None = None) -> None:
-        """Save sampler weights and hot-load them into the deployment."""
+    async def _sync_weights(self, name: str, checkpoint_type: str | None = None) -> str | None:
+        """Save sampler weights and hot-load them into the deployment.
+
+        Returns the snapshot_name on success, None on failure."""
         if self.weight_syncer is None:
-            return
-        await asyncio.to_thread(
+            return None
+        snapshot_name = await asyncio.to_thread(
             self.weight_syncer.save_and_hotload,
             name,
             checkpoint_type=checkpoint_type,
         )
         logger.info("Weights synced to deployment: %s", name)
-
+        return snapshot_name
+        
     # ------------------------------------------------------------------
-    # Forward-backward
-    # ------------------------------------------------------------------
-
-    def _remove_mask(self, datum: tinker.Datum) -> tinker.Datum:
-        """Remove mask from datum (not needed by forward_backward)."""
-        return tinker.Datum(
-            model_input=datum.model_input,
-            loss_fn_inputs={k: v for k, v in datum.loss_fn_inputs.items() if k != "mask"},
-        )
-
-    @staticmethod
-    def _strip_routing_matrices(datum: tinker.Datum) -> tinker.Datum:
-        """Strip routing matrices from a datum (reference model uses its own routing)."""
-        mi = datum.model_input
-        if getattr(mi, 'routing_matrices', None) is not None:
-            mi = mi.model_copy(update={"routing_matrices": None})
-            return tinker.Datum(model_input=mi, loss_fn_inputs=datum.loss_fn_inputs)
-        return datum
-
-    # ------------------------------------------------------------------
-    # Custom loss helpers (cookbook callable path)
+    # Loss helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_inf_logprobs_and_prompt_lens(
-        datums: list[tinker.Datum],
-    ) -> tuple[list[list[float]], list[int]]:
-        """Extract inference logprobs and prompt lengths from datums.
+    def _process_datums(
+        raw_datums: list[tinker.Datum],
+    ) -> tuple[list[tinker.Datum], list[float], list[list[float]], list[int], list[int]]:
+        """Extract rollout data and rebuild clean datums matching cookbook format.
 
-        Inference logprobs are stored in ``datum.loss_fn_inputs["logprobs"]``.
-        Prompt length is derived from the mask (index of first nonzero element).
+        Returns (clean_datums, advantages, inf_logprobs, prompt_lens, num_loss_tokens).
         """
+        clean_datums: list[tinker.Datum] = []
+        advantages: list[float] = []
         inf_logprobs: list[list[float]] = []
         prompt_lens: list[int] = []
-        for datum in datums:
-            lp = datum.loss_fn_inputs["logprobs"].data
-            inf_logprobs.append(list(lp))
-
+        num_loss_tokens: list[int] = []
+        for datum in raw_datums:
+            # Extract rollout data
+            inf_logprobs.append(list(datum.loss_fn_inputs["logprobs"].data))
             mask = datum.loss_fn_inputs["mask"].data
+            adv_data = datum.loss_fn_inputs["advantages"].data
             prompt_len = len(mask) + 1
+            scalar = 0.0
             for i, m in enumerate(mask):
                 if m != 0:
                     prompt_len = i + 1
-                    break
-            prompt_lens.append(prompt_len)
-        return inf_logprobs, prompt_lens
-
-    @staticmethod
-    def _extract_scalar_advantages(datums: list[tinker.Datum]) -> list[float]:
-        """Extract one scalar advantage per datum.
-
-        rllm stores per-token advantages (broadcast for GRPO). The cookbook
-        expects one scalar per datum — take the first response-token value.
-        """
-        advantages: list[float] = []
-        for datum in datums:
-            adv_data = datum.loss_fn_inputs["advantages"].data
-            mask_data = datum.loss_fn_inputs["mask"].data
-            # Find first response token (first nonzero mask position)
-            scalar = 0.0
-            for i, m in enumerate(mask_data):
-                if m != 0:
                     scalar = float(adv_data[i])
                     break
+            prompt_lens.append(prompt_len)
             advantages.append(scalar)
-        return advantages
+            num_loss_tokens.append(int(sum(mask)))
 
-    @staticmethod
-    def _prepare_datum_for_custom_loss(datum: tinker.Datum) -> tinker.Datum:
-        """Prepare a datum for the cookbook callable loss path.
+            # Rebuild clean datum: target_tokens + loss_mask only
+            inputs = {"target_tokens": datum.loss_fn_inputs["target_tokens"]}
+            if "mask" in datum.loss_fn_inputs:
+                inputs["loss_mask"] = datum.loss_fn_inputs["mask"]
+            clean_datums.append(tinker.Datum(model_input=datum.model_input, loss_fn_inputs=inputs))
 
-        Renames ``mask`` → ``loss_mask`` (cookbook's ``_get_loss_mask`` reads
-        ``loss_fn_inputs["loss_mask"]``) and removes fields the callable
-        computes internally (``advantages``, ``logprobs``).
-        """
-        new_inputs = {}
-        for k, v in datum.loss_fn_inputs.items():
-            if k == "mask":
-                new_inputs["loss_mask"] = v
-            elif k in ("advantages", "logprobs"):
-                continue  # handled by the callable
-            else:
-                new_inputs[k] = v
-        return tinker.Datum(model_input=datum.model_input, loss_fn_inputs=new_inputs)
+        return clean_datums, advantages, inf_logprobs, prompt_lens, num_loss_tokens
 
     async def _compute_proximal_logprobs(
         self,
@@ -257,108 +205,58 @@ class FireworksPolicyTrainer:
 
         Only called when ``bypass_mode=False`` (3-policy / decoupled PPO).
         """
-        stripped = [self._remove_mask(d) for d in datums]
         prox_fwd = await asyncio.to_thread(
-            self.training_client.forward, stripped, "cross_entropy",
+            self.training_client.forward, datums, "cross_entropy",
         )
         return [out["logprobs"].data for out in prox_fwd.loss_fn_outputs]
 
-    def _build_custom_loss(
-        self,
-        algorithm_config: AlgorithmConfig,
-        advantages: list[float],
-        ref_logprobs: list[list[float]],
-        prompt_lens: list[int],
-        inf_logprobs: list[list[float]],
-        prox_logprobs: list[list[float]],
-    ):
-        """Build a cookbook callable loss function.
+    def resolve_builtin_loss(self, algorithm_config: AlgorithmConfig, profile=None):
+        """Resolve the builtin server-side loss kernel at setup time.
 
-        Returns a callable ``(data, logprobs_list) -> (loss, metrics)``
-        suitable for ``forward_backward_custom``.
+        Must be called before the first forward-backward pass.
+        Raises ValueError if the loss has no builtin kernel or PP > 1.
         """
-        from training.utils.rl.losses import build_loss_fn
-        from training.utils.rl.importance_sampling import ISConfig
+        from training.utils.rl.losses import resolve_builtin_loss
         from training.utils.rl.dapo import DAPOConfig
+        from training.utils.rl.dro import DROConfig
         from training.utils.rl.gspo import GSPOConfig
         from training.utils.rl.cispo import CISPOConfig
 
-        rc = algorithm_config.rollout_correction
         eps = algorithm_config.eps_clip
         eps_high = algorithm_config.eps_clip_high
         loss_fn_name = algorithm_config.loss_fn or "grpo"
 
-        is_config = ISConfig(
+        result = resolve_builtin_loss(
+            loss_fn_name,
+            profile,
+            dapo_config=DAPOConfig(
+                eps_clip=eps,
+                eps_clip_high=eps_high if eps_high is not None else 0.28,
+            ),
+            dro_config=DROConfig(),
+            gspo_config=GSPOConfig(
+                clip_ratio_low=eps,
+                clip_ratio_high=eps_high,
+            ),
+            cispo_config=CISPOConfig(
+                eps_low=eps,
+                eps_high=eps_high if eps_high is not None else 0.28,
+            ),
             eps_clip=eps,
             eps_clip_high=eps_high,
-            tis_cap=rc.tis_cap,
-            tis_level=rc.tis_mode or "token",
         )
-        dapo_config = DAPOConfig(
-            eps_clip=eps,
-            eps_clip_high=eps_high if eps_high is not None else 0.28,
-        )
-        gspo_config = GSPOConfig(
-            clip_ratio=eps,
-            clip_ratio_high=eps_high,
-            kl_beta=algorithm_config.kl_beta,
-        )
-        cispo_config = CISPOConfig(
-            eps_low=eps,
-            eps_high=eps_high if eps_high is not None else 0.28,
-        )
-
-        builder = build_loss_fn(
-            policy_loss=loss_fn_name,
-            kl_beta=algorithm_config.kl_beta,
-            dapo_config=dapo_config,
-            gspo_config=gspo_config,
-            cispo_config=cispo_config,
-            is_config=is_config,
-        )
-        return builder(advantages, ref_logprobs, prompt_lens, inf_logprobs, prox_logprobs)
+        if result is None:
+            from training.utils.rl.losses import SUPPORTED_POLICY_LOSSES
+            raise ValueError(
+                f"loss_fn='{loss_fn_name}' has no builtin server-side kernel. "
+                f"Supported: {', '.join(SUPPORTED_POLICY_LOSSES)}"
+            )
+        self._builtin_loss = result
+        logger.info("Resolved builtin loss: kernel=%s, config=%s", result[0], result[1])
 
     # ------------------------------------------------------------------
     # Forward-backward
     # ------------------------------------------------------------------
-
-    async def _build_loss_for_datums(
-        self,
-        datums: list[tinker.Datum],
-        algorithm_config: AlgorithmConfig,
-    ):
-        """Compute proximal/ref logprobs and build a Fireworks cookbook callable loss.
-
-        Fireworks always uses the cookbook callable path (``forward_backward_custom``
-        only accepts callables, not string loss names).
-
-        When ``bypass_mode=True`` (default), proximal logprobs are set to
-        inference logprobs (no extra forward pass, TIS weight = 1.0).
-        When ``bypass_mode=False``, a proximal forward pass is run for
-        3-policy / decoupled PPO with active TIS correction.
-        """
-        rc = algorithm_config.rollout_correction
-        inf_logprobs, prompt_lens = self._extract_inf_logprobs_and_prompt_lens(datums)
-        advantages = self._extract_scalar_advantages(datums)
-
-        # Proximal logprobs
-        if rc.bypass_mode:
-            prox_logprobs = inf_logprobs
-        else:
-            prox_logprobs = await self._compute_proximal_logprobs(datums)
-
-        # Reference logprobs
-        if algorithm_config.kl_beta > 0 and self.reference_client is not None:
-            stripped = [self._remove_mask(d) for d in datums]
-            if algorithm_config.router_replay:
-                stripped = [self._strip_routing_matrices(d) for d in stripped]
-            ref_logprobs = await self.compute_reference_logprobs(stripped)
-        else:
-            ref_logprobs = [[] for _ in datums]
-
-        return self._build_custom_loss(
-            algorithm_config, advantages, ref_logprobs, prompt_lens, inf_logprobs, prox_logprobs,
-        )
 
     @require_training_client
     async def forward_backward_from_trajectory_groups(
@@ -366,32 +264,54 @@ class FireworksPolicyTrainer:
         trajectory_groups: list[TrajectoryGroup],
         algorithm_config: AlgorithmConfig | None = None,
     ) -> tuple[list[tinker.Datum] | dict[str, list[tinker.Datum]], list[torch.Tensor], dict]:
-        """Run forward-backward pass from trajectory groups.
-
-        Always uses the Fireworks cookbook callable loss path. Optionally runs
-        proximal and/or reference forward passes based on ``algorithm_config``.
+        """Run forward-backward pass using the builtin server-side loss kernel.
 
         Args:
             trajectory_groups: List of TrajectoryGroup objects (already filtered/transformed).
-            algorithm_config: Algorithm config for advantage computation
-                (uses ``self.algorithm_config`` if None).
+            algorithm_config: Algorithm config (uses ``self.algorithm_config`` if None).
 
         Returns:
             ``(training_datums, training_logprobs, adv_metrics)``
         """
+        from training.utils.rl.losses import build_builtin_loss_datums
+        from training.utils.rl.tis import TISConfig
+
         if algorithm_config is None:
             algorithm_config = self.algorithm_config
 
-        training_datums, adv_metrics = transform_trajectory_groups_to_datums(
+        raw_datums, adv_metrics = transform_trajectory_groups_to_datums(
             trajectory_groups,
             algorithm_config=algorithm_config,
         )
 
-        loss_fn = await self._build_loss_for_datums(training_datums, algorithm_config)
-        prepared = [self._prepare_datum_for_custom_loss(d) for d in training_datums]
+        rc = algorithm_config.rollout_correction
+        clean_datums, advantages, inf_logprobs, prompt_lens, num_loss_tokens = self._process_datums(raw_datums)
 
+        # seq_mean_token_mean: normalize advantages by number of loss tokens so that
+        # token-sum within each sequence equals token-mean, then NUM_SEQUENCES
+        # at optim_step gives seq-mean-token-mean overall.
+        if algorithm_config.loss_agg_mode == "seq_mean_token_mean":
+            for i in range(len(advantages)):
+                advantages[i] /= max(1, num_loss_tokens[i])
+
+        # Proximal logprobs
+        if rc.bypass_mode:
+            prox_logprobs = inf_logprobs
+        else:
+            prox_logprobs = await self._compute_proximal_logprobs(clean_datums)
+
+        # Build datums for the builtin kernel
+        tis_config = TISConfig(level=rc.tis_mode or "token", cap=rc.tis_cap) if rc.tis_mode else None
+        builtin_datums = build_builtin_loss_datums(
+            clean_datums, advantages, prox_logprobs, inf_logprobs, prompt_lens,
+            tis_config=tis_config,
+            policy_loss=algorithm_config.loss_fn or "grpo",
+        )
+
+        kernel_loss, kernel_config = self._builtin_loss
         fwd_bwd_result = await asyncio.to_thread(
-            self.training_client.forward_backward_custom, prepared, loss_fn,
+            self.training_client.forward_backward, builtin_datums, kernel_loss,
+            loss_fn_config=kernel_config,
         )
 
         training_logprobs = []
@@ -439,7 +359,17 @@ class FireworksPolicyTrainer:
             weight_decay=weight_decay,
             grad_clip_norm=grad_clip_norm,
         )
-        optim_result = await asyncio.to_thread(self.training_client.optim_step, adam_params)
+        from fireworks.training.sdk.client import GradAccNormalization
+        _LOSS_AGG_MAP = {
+            "token_mean": GradAccNormalization.NUM_LOSS_TOKENS,
+            "seq_mean_token_sum": GradAccNormalization.NUM_SEQUENCES,
+            "seq_mean_token_mean": GradAccNormalization.NUM_SEQUENCES,
+        }
+        grad_norm = _LOSS_AGG_MAP.get(self.algorithm_config.loss_agg_mode)
+        optim_result = await asyncio.to_thread(
+            self.training_client.optim_step, adam_params,
+            grad_accumulation_normalization=grad_norm,
+        )
 
         metrics = {}
         if hasattr(optim_result, "metrics") and optim_result.metrics:
@@ -454,9 +384,28 @@ class FireworksPolicyTrainer:
     # ------------------------------------------------------------------
 
     @require_training_client
-    async def sync_weights(self, step: int) -> None:
-        """Hot-load current weights into the inference deployment."""
-        await self._sync_weights(f"step-{step}")
+    async def sync_weights(self, step: int) -> str | None:
+        """Hot-load current weights into the inference deployment.
+
+        Returns the snapshot_name on success, None on failure."""
+        return await self._sync_weights(f"step-{step}")
+
+    async def promote_checkpoint(self, snapshot_name: str, output_model_id: str) -> None:
+        """Promote a sampler checkpoint to a deployable Fireworks model."""
+        if self._rlor_mgr is None or self._policy_job_id is None:
+            logger.warning("Cannot promote: rlor_mgr or policy_job_id not set")
+            return
+        try:
+            await asyncio.to_thread(
+                self._rlor_mgr.promote_checkpoint,
+                self._policy_job_id,
+                snapshot_name,
+                output_model_id,
+            )
+            logger.info("Promoted checkpoint '%s' -> model '%s'", snapshot_name, output_model_id)
+        except Exception:
+            logger.exception("Failed to promote checkpoint '%s'", snapshot_name)
+            raise
 
     @require_training_client
     async def save_dcp_checkpoint(self, step: int) -> None:
@@ -469,24 +418,3 @@ class FireworksPolicyTrainer:
             logger.exception("Failed to save DCP checkpoint %s", name)
             raise
 
-    # ------------------------------------------------------------------
-    # Reference log-probs
-    # ------------------------------------------------------------------
-
-    @require_training_client
-    async def compute_reference_logprobs(
-        self,
-        datums: list[tinker.Datum],
-    ) -> list[list[float]]:
-        """Compute reference log-probs for a batch of datums.
-
-        Requires ``self.reference_client`` to be set.
-
-        Returns:
-            Per-datum list of per-token log-probs.
-        """
-        if self.reference_client is None:
-            raise RuntimeError("reference_client not set")
-
-        ref_fwd = await asyncio.to_thread(self.reference_client.forward, datums, "cross_entropy")
-        return [out["logprobs"].data for out in ref_fwd.loss_fn_outputs]

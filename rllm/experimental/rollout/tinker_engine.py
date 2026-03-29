@@ -299,6 +299,7 @@ class TinkerEngine(RolloutEngine):
             prompt_length=_flat_token_input_length(token_input),
             completion_length=len(response_tokens),
             finish_reason=finish_reason,
+            metrics=getattr(sampled_sequence, 'server_metrics', None),
         )
 
     @override
@@ -343,8 +344,18 @@ class TinkerEngine(RolloutEngine):
             # Build prompt using renderer
             token_input: TinkerTokenInput = self.renderer.build_generation_prompt(converted_messages).chunks  # type: ignore
 
+        version = self.weight_version
         sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
-        return self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result.weight_version = version
+        return result
+
+    async def get_model_response_from_tokens(self, token_input: TokenInput, **kwargs) -> ModelOutput:
+        version = self.weight_version
+        sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
+        result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result.weight_version = version
+        return result
 
     async def compute_logprobs(self, ids: list[int]) -> list[float]:
         ids = ids[: self.max_model_length]

@@ -12,8 +12,8 @@ from rllm.workflows.workflow import TerminationReason
 class AsyncTrainingConfig:
     """Controls the async training behavior spectrum.
 
-    When `enabled` is False, the trainer uses the current synchronous pipeline.
-    When `enabled` is True, the trainer runs concurrent generation + training
+    When `enable` is False, the trainer uses the current synchronous pipeline.
+    When `enable` is True, the trainer runs concurrent generation + training
     with group-level streaming and dispatch-time throttle.
 
     Behavior spectrum:
@@ -23,7 +23,7 @@ class AsyncTrainingConfig:
         - staleness_threshold>0, partial_rollout=True: Async with partial rollout
     """
 
-    enabled: bool = False
+    enable: bool = False
     mini_batch_size: int = 1            # episode groups per optimizer step
     streaming_chunks: int = 1           # forward-backward passes per optimizer step (must divide mini_batch_size)
     staleness_threshold: float = 0.0    # 0.0 = on-policy. Controls dispatch throttle quota.
@@ -31,7 +31,7 @@ class AsyncTrainingConfig:
     partial_rollout: bool = True        # enable turn-level gating during weight sync
 
     def __post_init__(self):
-        if self.enabled:
+        if self.enable:
             assert self.streaming_chunks >= 1
             assert self.mini_batch_size % self.streaming_chunks == 0, (
                 f"mini_batch_size ({self.mini_batch_size}) must be divisible by streaming_chunks ({self.streaming_chunks})"
@@ -59,6 +59,7 @@ class CompactFilteringConfig:
     mask_timeout: bool = False
     mask_unknown: bool = False
     mask_error: bool = False
+    mask_format_error: bool = False
 
     @classmethod
     def from_config(cls, config: DictConfig) -> "CompactFilteringConfig":
@@ -81,7 +82,7 @@ class CompactFilteringConfig:
         """
         if not self.enable:
             return False
-        return (self.mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED) or (self.mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED) or (self.mask_env_done and termination_reason == TerminationReason.ENV_DONE) or (self.mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED) or (self.mask_timeout and termination_reason == TerminationReason.TIMEOUT) or (self.mask_unknown and termination_reason == TerminationReason.UNKNOWN) or (self.mask_error and termination_reason == TerminationReason.ERROR)
+        return (self.mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED) or (self.mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED) or (self.mask_env_done and termination_reason == TerminationReason.ENV_DONE) or (self.mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED) or (self.mask_timeout and termination_reason == TerminationReason.TIMEOUT) or (self.mask_unknown and termination_reason == TerminationReason.UNKNOWN) or (self.mask_error and termination_reason == TerminationReason.ERROR) or (self.mask_format_error and termination_reason == TerminationReason.FORMAT_ERROR)
 
 
 @dataclass
@@ -181,6 +182,7 @@ class AlgorithmConfig:
     kl_beta: float = 0.0
     eps_clip: float = 0.2
     eps_clip_high: float | None = None
+    loss_agg_mode: Literal["token_mean", "seq_mean_token_sum", "seq_mean_token_mean", None] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
     router_replay: bool = False
 
@@ -211,6 +213,7 @@ class AlgorithmConfig:
             kl_beta=config.rllm.algorithm.get("kl_beta", 0.0),
             eps_clip=config.rllm.algorithm.get("eps_clip", 0.2),
             eps_clip_high=config.rllm.algorithm.get("eps_clip_high", None),
+            loss_agg_mode=config.rllm.algorithm.get("loss_agg_mode", None),
             rollout_correction=rollout_correction,
             router_replay=config.rllm.algorithm.get("router_replay", False),
         )

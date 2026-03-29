@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from training.utils import (
     ReconnectableClient,
+    ResourceCleanup,
     create_trainer_job,
     setup_deployment,
 )
@@ -30,24 +32,24 @@ from omegaconf import DictConfig
 from transformers import AutoTokenizer
 
 # fix:fireworks - tinker 0.15.0 sends project_id=None, server rejects it
-from tinker.types import CreateSessionRequest
-_orig_model_dump = CreateSessionRequest.model_dump
-def _patched_model_dump(self, **kwargs):
-    result = _orig_model_dump(self, **kwargs)
-    if result.get("project_id") is None:
-        result.pop("project_id", None)
-    return result
-CreateSessionRequest.model_dump = _patched_model_dump
+# from tinker.types import CreateSessionRequest
+# _orig_model_dump = CreateSessionRequest.model_dump
+# def _patched_model_dump(self, **kwargs):
+#     result = _orig_model_dump(self, **kwargs)
+#     if result.get("project_id") is None:
+#         result.pop("project_id", None)
+#     return result
+# CreateSessionRequest.model_dump = _patched_model_dump
 
 # fix:fireworks - optim_step sends grad_accumulation_normalization via extra_body, server rejects it
-from fireworks.training.sdk.client import FiretitanTrainingClient
-from tinker.lib.public_interfaces.training_client import TrainingClient
-FiretitanTrainingClient.optim_step = TrainingClient.optim_step
-from training.utils.client import ReconnectableClient as _RC
-_orig_rc_optim_step = _RC.optim_step
-def _patched_rc_optim_step(self, params, grad_accumulation_normalization=None):
-    return self._client.optim_step(params).result(timeout=self._default_timeout)
-_RC.optim_step = _patched_rc_optim_step
+# from fireworks.training.sdk.client import FiretitanTrainingClient
+# from tinker.lib.public_interfaces.training_client import TrainingClient
+# FiretitanTrainingClient.optim_step = TrainingClient.optim_step
+# from training.utils.client import ReconnectableClient as _RC
+# _orig_rc_optim_step = _RC.optim_step
+# def _patched_rc_optim_step(self, params, grad_accumulation_normalization=None):
+#     return self._client.optim_step(params).result(timeout=self._default_timeout)
+# _RC.optim_step = _patched_rc_optim_step
 
 from rllm.experimental.common import simple_timer
 from rllm.experimental.rollout import FireworksEngine, RolloutEngine
@@ -111,12 +113,9 @@ class FireworksBackend(TinkerBackend):
         # Fireworks-specific handles (populated in _init_fireworks_infra)
         self.weight_syncer: WeightSyncer | None = None
         self._policy_rc: ReconnectableClient | None = None
-        self._reference_rc: ReconnectableClient | None = None
         self._rlor_mgr: TrainerJobManager | None = None
         self._deploy_mgr: DeploymentManager | None = None
-        self._policy_job_id: str | None = None
-        self._reference_job_id: str | None = None
-        self._deployment_id: str | None = None
+        self._cleanup: ResourceCleanup | None = None
 
     # ------------------------------------------------------------------
     # Fireworks infrastructure setup
@@ -150,6 +149,7 @@ class FireworksBackend(TinkerBackend):
             tokenizer_model=cfg_section.get("tokenizer_model"),
             sample_timeout=cfg_section.get("sample_timeout", 600),
             disable_speculative_decoding=cfg_section.get("disable_speculative_decoding", True),
+            replica_count=cfg_section.get("replica_count"),
             extra_values=dict(cfg_section.get("extra_values") or {}) or None,
         )
 
@@ -158,16 +158,26 @@ class FireworksBackend(TinkerBackend):
         ReconnectableClient, WeightSyncer, and DeploymentSampler."""
         cfg = self.full_config
         api_key = os.environ["FIREWORKS_API_KEY"]
-        account = cfg.get("account") or os.environ.get("FIREWORKS_ACCOUNT_ID", "")
         base_url = cfg.get("fireworks_base_url", "https://api.fireworks.ai")
 
-        self._rlor_mgr = TrainerJobManager(api_key=api_key, account_id=account, base_url=base_url)
-        self._deploy_mgr = DeploymentManager(api_key=api_key, account_id=account, base_url=base_url)
-        rlor_mgr = self._rlor_mgr
-        deploy_mgr = self._deploy_mgr
+        rlor_mgr = TrainerJobManager(api_key=api_key, base_url=base_url)
+        deploy_mgr = DeploymentManager(api_key=api_key, base_url=base_url)
+        self._rlor_mgr = rlor_mgr
+        self._deploy_mgr = deploy_mgr
+        self._cleanup = ResourceCleanup(rlor_mgr, deploy_mgr)
 
         infra = self._to_infra_config(cfg.training_infra)
         deploy = self._to_deploy_config(cfg.deployment)
+
+        # When partial_rollout is enabled, the Fireworks server handles
+        # pausing/resuming in-flight generations during hot-load weight sync.
+        async_cfg = cfg.rllm.get("async_training", {})
+        if async_cfg.get("partial_rollout", False) and async_cfg.get("enable", False):
+            extra = list(deploy.deployment_extra_args or [])
+            if "--hot-load-async-transition" not in extra:
+                extra.append("--hot-load-async-transition")
+                deploy.deployment_extra_args = extra
+                logger.info("Added --hot-load-async-transition for partial_rollout mode")
 
         # Resolve training shape profile and auto-derive config values
         profile = None
@@ -180,62 +190,41 @@ class FireworksBackend(TinkerBackend):
             if profile.max_supported_context_length and not cfg.training.get("max_length"):
                 cfg.training.max_length = profile.max_supported_context_length
                 logger.info("Auto-derived max_length from training shape: %d", cfg.training.max_length)
+            pp = getattr(profile, "pipeline_parallelism", 1)
+            if pp > 1:
+                raise ValueError(
+                    f"Pipeline parallelism (PP={pp}) is not supported. "
+                    f"Use a training shape with PP=1."
+                )
 
         deployment_id = deploy.deployment_id
         dep_info = setup_deployment(deploy_mgr, deploy, cfg.model.name, infra)
+        self._cleanup.deployment(deployment_id, action="delete")
 
-        use_reference = cfg.rllm.algorithm.get("kl_beta", 0.0) > 0
-
-        ref_profile = None
-        if use_reference:
-            if infra.ref_training_shape_id:
-                ref_profile = rlor_mgr.resolve_training_profile(infra.ref_training_shape_id)
-            elif profile is not None:
-                ref_profile = profile
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            pol_fut = pool.submit(
-                create_trainer_job,
-                rlor_mgr,
-                base_model=cfg.model.name,
-                infra=infra,
-                profile=profile,
-                lora_rank=cfg.model.get("lora_rank", 0),
-                max_seq_len=cfg.training.max_length,
-                learning_rate=cfg.training.learning_rate,
-                display_name=cfg.get("display_name", "rllm-policy"),
-                hot_load_deployment_id=deployment_id,
+        kl_beta = cfg.rllm.algorithm.get("kl_beta", 0.0)
+        if kl_beta > 0:
+            raise ValueError(
+                f"kl_beta={kl_beta} is not supported with server-side builtin losses. "
+                f"Set kl_beta=0 in your config."
             )
-            if use_reference:
-                ref_fut = pool.submit(
-                    create_trainer_job,
-                    rlor_mgr,
-                    base_model=cfg.model.name,
-                    infra=infra,
-                    profile=ref_profile,
-                    lora_rank=cfg.model.get("lora_rank", 0),
-                    max_seq_len=cfg.training.max_length,
-                    learning_rate=cfg.training.learning_rate,
-                    display_name=cfg.get("display_name", "rllm-ref"),
-                    forward_only=True,
-                )
-            policy_ep = pol_fut.result()
-            reference_ep = ref_fut.result() if use_reference else None
+
+        policy_ep = create_trainer_job(
+            rlor_mgr,
+            base_model=cfg.model.name,
+            infra=infra,
+            profile=profile,
+            lora_rank=cfg.model.get("lora_rank", 0),
+            max_seq_len=cfg.training.max_length,
+            learning_rate=cfg.training.learning_rate,
+            display_name=f"rllm-policy-{int(time.time())}",
+            hot_load_deployment_id=deployment_id,
+            cleanup=self._cleanup,
+        )
 
         self._policy_job_id = policy_ep.job_id
-        self._reference_job_id = reference_ep.job_id if reference_ep else None
-        self._deployment_id = deployment_id
-
         self._policy_rc = ReconnectableClient(
             rlor_mgr, policy_ep.job_id, cfg.model.name,
             lora_rank=cfg.model.get("lora_rank", 0),
-        )
-        self._reference_rc = (
-            ReconnectableClient(
-                rlor_mgr, reference_ep.job_id, cfg.model.name,
-                lora_rank=cfg.model.get("lora_rank", 0),
-            )
-            if reference_ep else None
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -256,6 +245,8 @@ class FireworksBackend(TinkerBackend):
             base_model=cfg.model.name,
             hotload_timeout=cfg.hotload.hot_load_timeout,
             dcp_timeout=cfg.hotload.get("dcp_timeout", 2700),
+            warmup_after_hotload=cfg.hotload.get("warmup_after_hotload", True),
+            warmup_max_retries=cfg.hotload.get("warmup_max_retries", 10),
         )
 
     # ------------------------------------------------------------------
@@ -268,11 +259,12 @@ class FireworksBackend(TinkerBackend):
         self.policy_trainer = FireworksPolicyTrainer(
             config=self.full_config,
             training_client=self._policy_rc,
-            reference_client=self._reference_rc,
             weight_syncer=self.weight_syncer,
             cf_config=kwargs.get("cf_config"),
             transform_config=kwargs.get("transform_config"),
             algorithm_config=kwargs.get("algorithm_config"),
+            rlor_mgr=self._rlor_mgr,
+            policy_job_id=self._policy_job_id,
         )
 
         self.rollout_engine = FireworksEngine(
@@ -303,19 +295,13 @@ class FireworksBackend(TinkerBackend):
             )
 
         # --- Algorithm / loss function validation ---
+        # Loss function validation is handled by resolve_builtin_loss() at setup time.
         alg = self.full_config.rllm.algorithm
         loss_fn = alg.get("loss_fn", None)
         eps_clip_high = alg.get("eps_clip_high", None)
         rc = alg.get("rollout_correction", {})
         tis_mode = rc.get("tis_mode", None)
         bypass_mode = rc.get("bypass_mode", True)
-
-        _FIREWORKS_COOKBOOK_LOSS_FNS = {"grpo", "dapo", "gspo", "cispo"}
-        if loss_fn is not None and loss_fn not in _FIREWORKS_COOKBOOK_LOSS_FNS:
-            raise ValueError(
-                f"loss_fn='{loss_fn}' is not a supported Fireworks cookbook loss function. "
-                f"Supported: {sorted(_FIREWORKS_COOKBOOK_LOSS_FNS)}"
-            )
 
         # eps_clip_high only meaningful for dapo/cispo (asymmetric clipping)
         if eps_clip_high is not None and loss_fn not in ("dapo", "cispo"):
@@ -338,6 +324,20 @@ class FireworksBackend(TinkerBackend):
                 "will be 1.0 (no correction). Set bypass_mode=false for active TIS.",
                 tis_mode,
             )
+
+        # save_freq must be a multiple of sync interval (save requires a sampler snapshot from sync)
+        save_freq = self.full_config.rllm.trainer.get("save_freq", -1)
+        if save_freq > 0:
+            async_cfg = self.full_config.rllm.get("async_training", {})
+            if async_cfg.get("enable", False):
+                sync_interval = async_cfg.get("trigger_parameter_sync_step", 1)
+            else:
+                sync_interval = self.full_config.hotload.get("hot_load_interval", 1)
+            if sync_interval > 0 and save_freq % sync_interval != 0:
+                raise ValueError(
+                    f"save_freq ({save_freq}) must be a multiple of sync interval ({sync_interval}). "
+                    f"Promotion requires a sampler snapshot created at sync time."
+                )
 
     # ------------------------------------------------------------------
     # Policy update (override — no fused path, uses ReconnectableClient)
@@ -373,65 +373,77 @@ class FireworksBackend(TinkerBackend):
         )
         trainer_state.global_step = start_step
 
+    async def _save_and_sync(
+        self, trainer_state: TrainerState, should_save: bool = False, should_sync: bool = False,
+    ) -> None:
+        """Unified save + sync + promote logic.
+
+        Args:
+            trainer_state: Current trainer state.
+            should_save: Save a DCP checkpoint and promote if sync also happens.
+            should_sync: Sync (hotload) weights to the inference deployment.
+        """
+        global_step = trainer_state.global_step
+
+        if should_save and not should_sync:
+            logger.warning(
+                "save_freq triggered at step %d but no sync — skipping save/promote "
+                "(save_freq must be a multiple of sync interval)",
+                global_step,
+            )
+
+        if should_sync:
+            with simple_timer("sync_weights", trainer_state.timing_dict):
+                snapshot_name = await self.policy_trainer.sync_weights(global_step)
+
+            if should_save:
+                with simple_timer("save_checkpoint", trainer_state.timing_dict):
+                    await self.policy_trainer.save_dcp_checkpoint(global_step)
+                if snapshot_name:
+                    experiment = self.full_config.rllm.trainer.get("experiment_name", "default")
+                    await self.policy_trainer.promote_checkpoint(
+                        snapshot_name, f"{experiment}-step-{global_step}",
+                    )
+
     async def on_train_end(self, trainer_state: TrainerState) -> None:
         assert self.policy_trainer is not None, "policy_trainer is not initialized"
-        logger.info("Saving final DCP checkpoint at step %d", trainer_state.global_step)
-        await self.policy_trainer.save_dcp_checkpoint(trainer_state.global_step)
+        logger.info("Saving final checkpoint at step %d", trainer_state.global_step)
+        await self._save_and_sync(trainer_state, should_save=True, should_sync=True)
 
     async def on_policy_updated(self, trainer_state: TrainerState) -> None:
+        """Called in async mode after optimizer step when coordinator triggers sync."""
         assert self.policy_trainer is not None
         self._policy_updated_this_step = True
-
-        global_step = trainer_state.global_step
         save_freq = self.full_config.rllm.trainer.save_freq
-
-        if save_freq > 0 and global_step % save_freq == 0:
-            await self.policy_trainer.save_dcp_checkpoint(global_step)
-
-        await self.policy_trainer.sync_weights(global_step)
+        step = trainer_state.global_step
+        await self._save_and_sync(
+            trainer_state,
+            should_save=save_freq > 0 and step % save_freq == 0,
+            should_sync=True,
+        )
 
     async def on_batch_end(self, trainer_state: TrainerState) -> None:
         assert self.policy_trainer is not None, "policy_trainer is not initialized"
 
-        global_step = trainer_state.global_step
-
-        # In async mode, on_policy_updated already handled checkpoint + hotload
+        # In async mode, on_policy_updated already handled save/sync
         if not self._policy_updated_this_step:
+            step = trainer_state.global_step
             save_freq = self.full_config.rllm.trainer.save_freq
-            if save_freq > 0 and global_step % save_freq == 0:
-                with simple_timer("save_checkpoint", trainer_state.timing_dict):
-                    await self.policy_trainer.save_dcp_checkpoint(global_step)
-
             hot_load_interval = self.full_config.hotload.get("hot_load_interval", 1)
-            if hot_load_interval > 0 and global_step % hot_load_interval == 0:
-                with simple_timer("sync_weights", trainer_state.timing_dict):
-                    await self.policy_trainer.sync_weights(global_step)
+            await self._save_and_sync(
+                trainer_state,
+                should_save=save_freq > 0 and step % save_freq == 0,
+                should_sync=hot_load_interval > 0 and step % hot_load_interval == 0,
+            )
         self._policy_updated_this_step = False
 
         learning_rate = trainer_state.extra_info.get("scheduled_learning_rate", self.learning_rate)
         update_training_metrics(trainer_state, learning_rate, trainer_state.total_steps)
 
         if trainer_state.metrics:
-            print_metrics_table(trainer_state.metrics, global_step)
+            print_metrics_table(trainer_state.metrics, trainer_state.global_step)
 
     def shutdown(self) -> None:
-        """Cleanup Fireworks resources: delete trainer jobs and scale deployment to zero."""
-        if self._rlor_mgr:
-            if self._policy_job_id:
-                try:
-                    logger.info("Deleting policy trainer job %s", self._policy_job_id)
-                    self._rlor_mgr.delete(self._policy_job_id)
-                except Exception as e:
-                    logger.warning("Failed to delete policy job: %s", e)
-            if self._reference_job_id:
-                try:
-                    logger.info("Deleting reference trainer job %s", self._reference_job_id)
-                    self._rlor_mgr.delete(self._reference_job_id)
-                except Exception as e:
-                    logger.warning("Failed to delete reference job: %s", e)
-        if self._deploy_mgr and self._deployment_id:
-            try:
-                logger.info("Scaling deployment %s to zero", self._deployment_id)
-                self._deploy_mgr.scale_to_zero(self._deployment_id)
-            except Exception as e:
-                logger.warning("Failed to scale deployment to zero: %s", e)
+        """Cleanup Fireworks resources via ResourceCleanup."""
+        if self._cleanup:
+            self._cleanup.__exit__(None, None, None)

@@ -84,7 +84,7 @@ class SyncCoordinator:
         self._steps_since_sync = 0
         self._total_syncs += 1
 
-    # --- Generation pause (for validation / non-partial weight sync) ---
+    # --- Generation pause (for validation / weight sync if partial_rollout is False) ---
 
     def pause_generation(self) -> None:
         self._generation_paused.clear()

@@ -58,16 +58,13 @@ algorithm:
   use_precomputed_advantage: false
   # for tinker backend only (avaiable options: importance_sampling, ppo, cispo, dro, cross_entropy)
   loss_fn: null
+  loss_agg_mode: null # [null, token-mean, seq-mean-token-sum]
 
-  # Custom loss / rollout correction (used by Fireworks backend with cookbook losses)
   kl_beta: 0.0           # KL penalty coefficient; >0 enables reference forward pass
   eps_clip: 0.2           # PPO clip epsilon
   eps_clip_high: null     # Asymmetric upper clip bound (null = symmetric)
+  router_replay: false # Router Replay (R3): replay MoE expert routing from inference during training
 
-  # Router Replay (R3): replay MoE expert routing from inference during training
-  router_replay: false
-
-  # Rollout correction: corrects FP8 (inference) vs FP32 (training) drift
   rollout_correction:
     bypass_mode: true     # true = use rollout logprobs as pi_old (2-policy), false = proximal forward (3-policy)
     tis_mode: null        # null = disabled, "token" or "sequence" = TIS importance sampling level
@@ -100,6 +97,7 @@ compact_filtering:
   mask_timeout: True
   mask_unknown: False
   mask_error: True
+  mask_format_error: False
 
 # Rejection sampling
 rejection_sample:
@@ -124,7 +122,7 @@ sdk:
 
 # Async Training Configuration
 async_training:
-  enabled: false
+  enable: false
   mini_batch_size: 1
   streaming_chunks: 1
   staleness_threshold: 0.0
