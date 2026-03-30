@@ -39,12 +39,12 @@ deployment:
   extra_values: null               # Extra Helm values dict (e.g. {"priorityClass": "deployment"})
 
 hotload:
-  hot_load_interval: 1             # Sync weights to deployment every N steps (0 = disabled)
   hot_load_timeout: 600            # Timeout for hotload_and_wait (seconds)
   hot_load_before_training: false  # Push initial weights to deployment before first step
   dcp_timeout: 2700                # Timeout for DCP save_state / load_state_with_optimizer (45 min)
   warmup_after_hotload: true       # Send warmup request after hotloading to prime caches
   warmup_max_retries: 10           # Max retries for post-hotload warmup
+  reset_prompt_cache: true         # Purge KV cache on deployment after hotloading weights
 
 training_infra:
   training_shape_id: qwen3-4b-minimum-h200

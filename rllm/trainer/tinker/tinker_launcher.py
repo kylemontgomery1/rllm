@@ -29,10 +29,7 @@ class TinkerTrainerLauncher(TrainerLauncher):
 
     def _build_trainer(self) -> UnifiedTrainer:
         """Build the appropriate trainer based on config."""
-        streaming_cfg = OmegaConf.select(self.config, "rllm.streaming_minibatch", default=None)
-        use_streaming = streaming_cfg is not None and streaming_cfg.get("enable", False)
-
-        trainer_kwargs = dict(
+        return UnifiedTrainer(
             backend_cls=TinkerBackend,
             config=self.config,
             workflow_class=self.workflow_class,
@@ -41,14 +38,6 @@ class TinkerTrainerLauncher(TrainerLauncher):
             workflow_args=self.workflow_args,
             **self.kwargs,
         )
-
-        if use_streaming:
-            from rllm.experimental.streaming_trainer import StreamingUnifiedTrainer
-
-            logger.info("Using StreamingUnifiedTrainer")
-            return StreamingUnifiedTrainer(**trainer_kwargs)
-        else:
-            return UnifiedTrainer(**trainer_kwargs)
 
     def train(self):
         trainer = None

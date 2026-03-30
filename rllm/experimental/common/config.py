@@ -25,16 +25,20 @@ class AsyncTrainingConfig:
 
     enable: bool = False
     mini_batch_size: int = 1            # episode groups per optimizer step
-    streaming_chunks: int = 1           # forward-backward passes per optimizer step (must divide mini_batch_size)
+    fwd_bwd_group_size: int | None = None  # task batches per forward-backward pass (default: mini_batch_size)
     staleness_threshold: float = 0.0    # 0.0 = on-policy. Controls dispatch throttle quota.
     trigger_parameter_sync_step: int = 1  # optimizer steps between weight sync + version bump
     partial_rollout: bool = True        # enable turn-level gating during weight sync
+    episode_offload_dir: str | None = None       # NVMe offload dir for pending episodes (None = disabled)
+    trajectory_group_offload_dir: str | None = None  # NVMe offload dir for queued task batches (None = disabled)
 
     def __post_init__(self):
+        if self.fwd_bwd_group_size is None:
+            self.fwd_bwd_group_size = self.mini_batch_size
         if self.enable:
-            assert self.streaming_chunks >= 1
-            assert self.mini_batch_size % self.streaming_chunks == 0, (
-                f"mini_batch_size ({self.mini_batch_size}) must be divisible by streaming_chunks ({self.streaming_chunks})"
+            assert self.fwd_bwd_group_size >= 1
+            assert self.mini_batch_size % self.fwd_bwd_group_size == 0, (
+                f"mini_batch_size ({self.mini_batch_size}) must be divisible by fwd_bwd_group_size ({self.fwd_bwd_group_size})"
             )
 
 

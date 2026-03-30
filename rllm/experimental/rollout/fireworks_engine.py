@@ -25,6 +25,7 @@ from fireworks.training.sdk import DeploymentSampler
 
 from typing_extensions import override
 
+from rllm.experimental.rollout.rollout_engine import ModelOutput
 from rllm.experimental.rollout.tinker_engine import (
     TinkerEngine,
     _flat_token_input_length,
@@ -39,7 +40,7 @@ from rllm.workflows import TerminationEvent, TerminationReason
 logger = logging.getLogger(__name__)
 
 _MAX_SAMPLE_ATTEMPTS = 5
-_TRANSIENT_ERROR_CODES = ("502", "503", "425", "Connection")
+_TRANSIENT_ERROR_CODES = ("502", "503", "425", "Connection", "incomplete chunked read")
 
 
 class _SampledSequenceAdapter:
@@ -121,7 +122,6 @@ class FireworksEngine(TinkerEngine):
             if max_model_length is not None
             else max_prompt_length + max_response_length - 1
         )
-        self.bypass_render_with_parser = True
         self.accumulate_reasoning = accumulate_reasoning
         self.reasoning_effort = reasoning_effort
 
@@ -140,6 +140,45 @@ class FireworksEngine(TinkerEngine):
     # ------------------------------------------------------------------
     # Token-in / token-out override
     # ------------------------------------------------------------------
+
+    @override
+    async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
+        application_id = kwargs.pop("application_id", None)
+
+        tools = kwargs.pop("tools", [])
+        accumulate_reasoning = kwargs.pop("accumulate_reasoning", self.accumulate_reasoning)
+        reasoning_effort = kwargs.pop("reasoning_effort", self.reasoning_effort)
+
+        prompt = self.chat_parser.parse(
+            messages,
+            add_generation_prompt=True,
+            is_first_msg=True,
+            tools=tools,
+            reasoning_effort=reasoning_effort,
+            accumulate_reasoning=accumulate_reasoning,
+        )
+        token_input = self.tokenizer.encode(prompt, add_special_tokens=False)
+
+        if application_id is not None:
+            kwargs["user"] = application_id
+
+        version = self.weight_version
+        sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
+        result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result.weight_version = version
+        return result
+
+    @override
+    async def get_model_response_from_tokens(self, token_input, **kwargs) -> ModelOutput:
+        application_id = kwargs.pop("application_id", None)
+        if application_id is not None:
+            kwargs["user"] = application_id
+
+        version = self.weight_version
+        sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
+        result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result.weight_version = version
+        return result
 
     @property
     def supports_token_in_token_out(self) -> bool:
@@ -180,7 +219,7 @@ class FireworksEngine(TinkerEngine):
         requested_max_tokens = sampling_params.pop("max_tokens", requested_max_tokens)
         max_tokens = self._prepare_max_tokens(requested_max_tokens, input_length)
 
-        for key in ("temperature", "top_p", "top_k", "prompt_cache_isolation_key"):
+        for key in ("temperature", "top_p", "top_k", "user"):
             if key in kwargs:
                 sampling_params[key] = kwargs.pop(key)
 
@@ -246,6 +285,7 @@ class FireworksEngine(TinkerEngine):
         """Call ``DeploymentSampler.async_completions_stream`` with transient-error retries.
 
         Returns (response_dict, server_metrics_dict)."""
+
         for attempt in range(_MAX_SAMPLE_ATTEMPTS):
             try:
                 result, server_metrics = await self.sampling_client.async_completions_stream(
@@ -253,7 +293,6 @@ class FireworksEngine(TinkerEngine):
                     max_tokens=max_tokens,
                     raw_output=True,
                     logprobs=True,
-                    top_logprobs=1,
                     http_timeout=self.sample_timeout,
                     **sampling_kwargs,
                 )
@@ -269,17 +308,13 @@ class FireworksEngine(TinkerEngine):
                     wait = 10 * (attempt + 1)
                     logger.warning(
                         "Attempt %d/%d failed (%s), retrying in %ds…",
-                        attempt + 1,
-                        _MAX_SAMPLE_ATTEMPTS,
-                        exc,
-                        wait,
+                        attempt + 1, _MAX_SAMPLE_ATTEMPTS, exc, wait,
                     )
                     await asyncio.sleep(wait)
                     continue
                 logger.error(
                     "Sampling failed permanently after %d attempts: %s",
-                    attempt + 1,
-                    exc,
+                    attempt + 1, exc,
                 )
                 raise
         raise RuntimeError("unreachable")

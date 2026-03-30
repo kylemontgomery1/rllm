@@ -39,8 +39,6 @@ class SyncCoordinator:
         self._generation_paused: asyncio.Event = asyncio.Event()
         self._generation_paused.set()
 
-        self.generation_done: bool = False
-
     @property
     def policy_version(self) -> int:
         return self._policy_version

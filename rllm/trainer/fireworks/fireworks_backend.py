@@ -247,6 +247,7 @@ class FireworksBackend(TinkerBackend):
             dcp_timeout=cfg.hotload.get("dcp_timeout", 2700),
             warmup_after_hotload=cfg.hotload.get("warmup_after_hotload", True),
             warmup_max_retries=cfg.hotload.get("warmup_max_retries", 10),
+            reset_prompt_cache=cfg.hotload.get("reset_prompt_cache", True),
         )
 
     # ------------------------------------------------------------------
@@ -331,13 +332,11 @@ class FireworksBackend(TinkerBackend):
             async_cfg = self.full_config.rllm.get("async_training", {})
             if async_cfg.get("enable", False):
                 sync_interval = async_cfg.get("trigger_parameter_sync_step", 1)
-            else:
-                sync_interval = self.full_config.hotload.get("hot_load_interval", 1)
-            if sync_interval > 0 and save_freq % sync_interval != 0:
-                raise ValueError(
-                    f"save_freq ({save_freq}) must be a multiple of sync interval ({sync_interval}). "
-                    f"Promotion requires a sampler snapshot created at sync time."
-                )
+                if sync_interval > 0 and save_freq % sync_interval != 0:
+                    raise ValueError(
+                        f"save_freq ({save_freq}) must be a multiple of trigger_parameter_sync_step ({sync_interval}). "
+                        f"Promotion requires a sampler snapshot created at sync time."
+                    )
 
     # ------------------------------------------------------------------
     # Policy update (override — no fused path, uses ReconnectableClient)
@@ -429,11 +428,10 @@ class FireworksBackend(TinkerBackend):
         if not self._policy_updated_this_step:
             step = trainer_state.global_step
             save_freq = self.full_config.rllm.trainer.save_freq
-            hot_load_interval = self.full_config.hotload.get("hot_load_interval", 1)
             await self._save_and_sync(
                 trainer_state,
                 should_save=save_freq > 0 and step % save_freq == 0,
-                should_sync=hot_load_interval > 0 and step % hot_load_interval == 0,
+                should_sync=True,
             )
         self._policy_updated_this_step = False
 

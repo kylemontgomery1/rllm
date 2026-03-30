@@ -124,10 +124,12 @@ sdk:
 async_training:
   enable: false
   mini_batch_size: 1
-  streaming_chunks: 1
+  fwd_bwd_group_size: null  # task batches per forward-backward pass (default: mini_batch_size)
   staleness_threshold: 0.0
   trigger_parameter_sync_step: 1
   partial_rollout: true
+  episode_offload_dir: null       # NVMe offload dir for pending episodes (null = disabled)
+  trajectory_group_offload_dir: null  # NVMe offload dir for queued task batches (null = disabled)
 
 # Episode Logging Configuration
 episode_logging:

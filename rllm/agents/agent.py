@@ -160,6 +160,17 @@ class Step:
             model_output=model_output,
         )
 
+    @classmethod
+    def create(cls, chat_completions: list[dict], model_output: ModelOutput) -> Step:
+        return cls(
+            chat_completions=chat_completions,
+            prompt_ids=model_output.prompt_ids or [],
+            response_ids=model_output.completion_ids or [],
+            logprobs=model_output.logprobs or [],
+            routing_matrices=getattr(model_output, 'routing_matrices', None),
+            weight_version=model_output.weight_version,
+        )
+
 
 @dataclass
 class Action:
@@ -324,6 +335,7 @@ class TrajectoryGroup:
     trajectories: list[Trajectory]
     group_id: str = ""
     metadata: list[dict] = field(default_factory=list)
+    weight_version: int = 0
 
     @cached_property
     def group_role(self) -> str:
