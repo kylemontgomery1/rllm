@@ -59,19 +59,16 @@ agent:
 
 # Tinker Engine Configuration
 rollout_engine:
-  reasoning_effort: "medium"
-  accumulate_reasoning: false
-  disable_thinking: false
-  bypass_render_with_parser: false
+  strip_thinking_from_history: true
   renderer_name: null
 
 # Data Configuration
 data:
   train_files: null
   val_files: null
-  max_prompt_length: 2048
+  max_prompt_length: 30720
   max_response_length: 2048
-  train_batch_size: 64
+  train_batch_size: 32
   val_batch_size: 32
 
 # On-policy Self-Distillation (OPSD) Configuration

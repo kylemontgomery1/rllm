@@ -16,8 +16,8 @@ from omegaconf import DictConfig
 
 from rllm.agents.agent import Episode
 from rllm.data import Dataset
+from rllm.engine.rollout import RolloutEngine
 from rllm.experimental.common.advantage import AlgorithmConfig, collect_reward_and_advantage_from_trajectory_groups
-from rllm.experimental.rollout import RolloutEngine
 
 if TYPE_CHECKING:
     from rllm.experimental.engine.unified_workflow_engine import UnifiedWorkflowEngine
@@ -37,6 +37,7 @@ class BackendProtocol(ABC, Generic[TDataset, TBatch]):
 
     name: str = "base_backend"
     requires_loop: bool = False
+    needs_weight_sync_gate: bool = True
 
     def __init__(self, config: DictConfig, **kwargs):
         """Initialize the backend.

@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from rllm.agents.agent import Episode, TrajectoryGroup
 from rllm.data import Dataset
+from rllm.engine.rollout import RolloutEngine
 from rllm.experimental.common.advantage import (
     AlgorithmConfig,
     collect_reward_and_advantage_from_trajectory_groups,
@@ -38,9 +39,9 @@ from rllm.experimental.engine.unified_workflow_engine import UnifiedWorkflowEngi
 from rllm.experimental.buffer import TrajectoryGroupBuffer
 from rllm.experimental.metrics import MetricsAggregator
 from rllm.experimental.protocol import BackendProtocol
-from rllm.experimental.rollout import RolloutEngine
 from rllm.experimental.sync_coordinator import SyncCoordinator, SyncCoordinatorConfig
 from rllm.utils import EpisodeLogger, Tracking, extract_source_metadata
+from rllm.workflows.store import Store
 from rllm.workflows.workflow import TerminationReason, Workflow
 
 
@@ -102,7 +103,7 @@ class UnifiedTrainer:
         self,
         backend_cls: type[BackendProtocol],
         config: DictConfig,
-        workflow_class: type[Workflow],
+        workflow_class: type[Workflow] | None = None,
         train_dataset: Dataset | None = None,
         val_dataset: Dataset | None = None,
         workflow_args: dict | None = None,
@@ -110,11 +111,21 @@ class UnifiedTrainer:
         *,
         traj_grouping_hook: Callable | None = None,
         traj_group_adv_estimator_map: dict | None = None,
+        store: Store | None = None,
         **kwargs,
     ):
-        """Initialize the UnifiedTrainer."""
+        """Initialize the UnifiedTrainer.
+
+        Provide exactly one of ``workflow_class`` or (``agent_flow`` AND ``evaluator``).
+        """
+        has_agent_flow = kwargs.get("agent_flow") is not None and kwargs.get("evaluator") is not None
+        remote_runtime_enabled = config.rllm.get("remote_runtime", {}).get("enabled", False)
+        if not has_agent_flow and not remote_runtime_enabled:
+            assert workflow_class is not None, "Either workflow_class, (agent_flow AND evaluator), or remote_runtime must be provided"
+
         self.workflow_class = workflow_class
         self.workflow_args = workflow_args or {}
+        self.store = store
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
@@ -149,20 +160,89 @@ class UnifiedTrainer:
             rs_config=self.rs_config,
             algorithm_config=self.algorithm_config,
         )
-        self.agent_workflow_engine = UnifiedWorkflowEngine(
-            workflow_cls=self.workflow_class,
-            workflow_args=self.workflow_args,
-            rollout_engine=rollout_engine,
-            config=self.config,
-            n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
-            retry_limit=self.rllm_config.workflow.retry_limit,
-            raise_on_error=self.rllm_config.workflow.raise_on_error,
-            episode_logger=self.episode_logger,
-        )
+
+        # Determine which engine path to use:
+        # 1. agent_flow + evaluator → AgentFlowEngine (gateway-based, local)
+        # 2. remote_runtime → RemoteAgentFlowEngine (gateway-based, remote)
+        # 3. workflow_class → UnifiedWorkflowEngine (direct)
+        self._gateway = None
+        self._remote_runtime = None
+
+        agent_flow = kwargs.get("agent_flow")
+        evaluator = kwargs.get("evaluator")
+
+        remote_runtime_cfg = self.rllm_config.get("remote_runtime", {})
+
+        if agent_flow is not None and evaluator is not None:
+            from rllm.experimental.engine.agent_flow_engine import AgentFlowEngine
+            from rllm.experimental.engine.gateway_manager import GatewayManager
+
+            gateway_mode = "process" if kwargs.get("backend_name") == "verl" else "thread"
+            self._gateway = GatewayManager(self.config, mode=gateway_mode)
+            self._gateway.start(rollout_engine)
+
+            self.agent_workflow_engine = AgentFlowEngine(
+                agent_flow=agent_flow,
+                evaluator=evaluator,
+                gateway=self._gateway,
+                model=self.config.get("model", {}).get("name", "default"),
+                n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
+                retry_limit=self.rllm_config.workflow.retry_limit,
+                raise_on_error=self.rllm_config.workflow.get("raise_on_error", True),
+                episode_logger=self.episode_logger,
+            )
+        elif remote_runtime_cfg.get("enabled", False):
+            from rllm.experimental.engine.gateway_manager import GatewayManager
+            from rllm.experimental.engine.remote_agent_flow_engine import (
+                RemoteAgentFlowEngine,
+            )
+            from rllm.experimental.engine.remote_runtime import (
+                RemoteRuntimeConfig,
+                create_remote_runtime,
+            )
+
+            gateway_mode = "process" if kwargs.get("backend_name") == "verl" else "thread"
+            self._gateway = GatewayManager(self.config, mode=gateway_mode)
+            self._gateway.start(rollout_engine)
+
+            remote_runtime_config = RemoteRuntimeConfig(
+                enabled=True,
+                backend=remote_runtime_cfg.get("backend", "agentcore"),
+                backend_config=dict(remote_runtime_cfg.get("backend_config", {})),
+                session_timeout=remote_runtime_cfg.get("session_timeout", 900.0),
+            )
+            self._remote_runtime = create_remote_runtime(
+                remote_runtime_config,
+                exp_id=self.rllm_config.trainer.experiment_name,
+                model_id=self.config.get("model", {}).get("name", "default"),
+            )
+
+            self.agent_workflow_engine = RemoteAgentFlowEngine(
+                runtime=self._remote_runtime,
+                gateway=self._gateway,
+                session_timeout=remote_runtime_config.session_timeout,
+                n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
+                episode_logger=self.episode_logger,
+            )
+        else:
+            self.agent_workflow_engine = UnifiedWorkflowEngine(
+                workflow_cls=self.workflow_class,
+                workflow_args=self.workflow_args,
+                rollout_engine=rollout_engine,
+                config=self.config,
+                n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
+                retry_limit=self.rllm_config.workflow.retry_limit,
+                raise_on_error=self.rllm_config.workflow.raise_on_error,
+                episode_logger=self.episode_logger,
+                store=self.store,
+            )
 
         self.tokenizer = None
         if hasattr(self.backend, "tokenizer"):
             self.tokenizer = self.backend.tokenizer
+
+        # Tracks in-flight async rollout tasks for drain/wait logic
+        self._in_flight_tasks: set[asyncio.Task] = set()
 
     def _validate_and_setup_configs(self):
         """Validate and setup common configs."""
@@ -241,8 +321,14 @@ class UnifiedTrainer:
 
     async def fit_async(self) -> None:
         """Public async entry point for the full training process."""
+        # Initialize remote runtime (if enabled) before the workflow pool
+        if self._remote_runtime is not None:
+            self._remote_runtime.initialize()
+
         # initialize the UnifiedWorkflowEngine (init the workflow pool)
-        await self.agent_workflow_engine.initialize_pool()
+        # AgentFlowEngine and RemoteAgentFlowEngine don't need pool initialization
+        if hasattr(self.agent_workflow_engine, "initialize_pool"):
+            await self.agent_workflow_engine.initialize_pool()
 
         trainer_state = TrainerState()
 
@@ -294,7 +380,7 @@ class UnifiedTrainer:
                 trainer_state.reset_batch()
 
                 await self.backend.on_batch_start(trainer_state)
-                with simple_timer("total_step", trainer_state.timing_dict):
+                with simple_timer("step", trainer_state.timing_dict):
                     await self._train_batch_async(batch, trainer_state)
                 await self.backend.on_batch_end(trainer_state)
 
@@ -383,7 +469,7 @@ class UnifiedTrainer:
             trainer_state.metrics[f"batch/termination_reason/{r.value}"] = termination_counts[r.value] / total_counts
 
     # =========================================================================
-    # Concurrent (async) training methods
+    # Fully-asynchronous training pipeline
     # =========================================================================
 
     async def _fit_fully_async(self, trainer_state: TrainerState) -> None:
@@ -391,7 +477,7 @@ class UnifiedTrainer:
         assert self.config.data.train_batch_size == 1, (
             f"Async training requires train_batch_size=1, got {self.config.data.train_batch_size}"
         )
-        assert not self.agent_workflow_engine.raise_on_error, (
+        assert not getattr(self.agent_workflow_engine, "raise_on_error", False), (
             "Async training requires raise_on_error=False so that process_task_with_retry always returns an episode"
         )
         coord_config = SyncCoordinatorConfig(
@@ -457,9 +543,11 @@ class UnifiedTrainer:
                                 task=t, task_id=tid, rollout_idx=ridx, result_idx=0
                             )
                             await buffer.add_episode(tid, episode)
-                        asyncio.create_task(_run_rollout())
+                        t = asyncio.create_task(_run_rollout())
+                        self._in_flight_tasks.add(t)
+                        t.add_done_callback(self._in_flight_tasks.discard)
 
-            await self._wait_for_all_workflows_idle()
+            await self._wait_for_drain()
         finally:
             buffer.mark_generation_complete()
 
@@ -470,27 +558,19 @@ class UnifiedTrainer:
         coordinator: SyncCoordinator,
         aggregator: MetricsAggregator,
     ) -> None:
-        """Consume task batches from buffer, run forward-backward + optimizer step.
-
-        Each task batch is all trajectory groups from one task's episodes.
-        fwd_bwd_group_size controls how many task batches go into each
-        forward-backward pass. The coordinator throttle slot is
-        freed here (not in the buffer) so staleness tracking is accurate.
-
-        All metrics flow through the shared MetricsAggregator and are flushed
-        into trainer_state.metrics at log time.
-        """
+        """Consume task batches from buffer, run forward-backward + optimizer step."""
         mini_batch_size = self.async_config.mini_batch_size
         fwd_bwd_group_size = self.async_config.fwd_bwd_group_size
         num_fwd_bwd_passes = mini_batch_size // fwd_bwd_group_size
         use_total_batches = self.rllm_config.trainer.get("total_batches", -1) > 0
-        rollout_engine = self.agent_workflow_engine.rollout_engine
+        rollout_engine = getattr(self.agent_workflow_engine, "rollout_engine", None)
 
         while True:
             trainer_state.reset_batch()
             step_start = time.perf_counter()
             weight_versions = []
             all_trajectory_groups: list[TrajectoryGroup] = []
+            all_episodes: list[Episode] = []
             groups_consumed = 0
             buffer_wait_time = 0.0
             done = False
@@ -511,10 +591,11 @@ class UnifiedTrainer:
                     coordinator.on_group_consumed()
                     groups_consumed += 1
 
-                    for group in task_batch:
+                    for group in task_batch.groups:
                         weight_versions.append(group.weight_version)
-                    chunk_groups.extend(task_batch)
-                    all_trajectory_groups.extend(task_batch)
+                    chunk_groups.extend(task_batch.groups)
+                    all_trajectory_groups.extend(task_batch.groups)
+                    all_episodes.extend(task_batch.episodes)
 
                 if not chunk_groups or done:
                     break
@@ -557,8 +638,9 @@ class UnifiedTrainer:
             if sync_time > 0:
                 aggregator.record("time/weight_sync", sync_time)
 
-            # Set all trajectory groups for visualization/logging
+            # Set all trajectory groups and stripped episodes for visualization/logging
             trainer_state.trajectory_groups = all_trajectory_groups
+            trainer_state.episodes = all_episodes
 
             if self.tokenizer is not None and trainer_state.has_trajectory_groups:
                 visualize_trajectory_last_steps(
@@ -579,6 +661,7 @@ class UnifiedTrainer:
             self.logger.log(
                 data=trainer_state.metrics,
                 step=trainer_state.global_step,
+                episodes=trainer_state.episodes,
                 trajectory_groups=trainer_state.trajectory_groups,
             )
 
@@ -591,44 +674,54 @@ class UnifiedTrainer:
             if use_total_batches and trainer_state.global_step >= self.rllm_config.trainer.total_batches:
                 break
 
-    async def _perform_weight_sync(self, trainer_state: TrainerState, coordinator: SyncCoordinator, rollout_engine: RolloutEngine) -> None:
+    async def _perform_weight_sync(self, trainer_state: TrainerState, coordinator: SyncCoordinator, rollout_engine: RolloutEngine | None) -> None:
         """Synchronize weights between training and rollout engines.
 
-        Two modes depending on partial_rollout:
-        - partial_rollout=True: Uses rollout engine gate (model-call level).
+        Gating behavior depends on backend.needs_weight_sync_gate:
+        - False (e.g. Tinker): skip gating, just update weights in-place.
+        - True + partial_rollout=True: gate at model-call level (rollout engine or gateway).
           Workflows block between turns, resume with new weights.
-        - partial_rollout=False: Uses coordinator generation pause (dispatch level).
+        - True + partial_rollout=False: pause at dispatch level (coordinator).
           Workflows finish naturally, gate stays open.
         """
+        gateway = getattr(self.agent_workflow_engine, "gateway", None)
+
         if self.async_config.partial_rollout:
-            # Block new model calls; in-flight calls finish, workflows pause between turns
-            rollout_engine.close_gate()
-            await rollout_engine.wait_for_drain()
+            if self.backend.needs_weight_sync_gate:
+                if rollout_engine is not None:
+                    rollout_engine.close_gate()
+                    await rollout_engine.wait_for_drain()
+                elif gateway is not None:
+                    gateway.close_gate()
+                    await gateway.wait_for_drain()
         else:
-            # Stop dispatching new prompts, let all workflows finish naturally
             coordinator.pause_generation()
-            await self._wait_for_all_workflows_idle()
+            await self._wait_for_drain()
 
         trainer_state.policy_version = coordinator.policy_version + 1
         await self.backend.on_policy_updated(trainer_state)
-        rollout_engine.weight_version = trainer_state.policy_version
+        if rollout_engine is not None:
+            rollout_engine.weight_version = trainer_state.policy_version
         coordinator.on_sync_complete()
 
         if self.async_config.partial_rollout:
-            rollout_engine.open_gate()
+            if self.backend.needs_weight_sync_gate:
+                if rollout_engine is not None:
+                    rollout_engine.open_gate()
+                elif gateway is not None:
+                    gateway.open_gate()
         else:
             coordinator.resume_generation()
 
-    async def _wait_for_all_workflows_idle(self) -> None:
-        """Wait for all n_parallel_tasks workflows to return to the pool."""
-        pool = self.agent_workflow_engine
-        while pool.workflow_queue.qsize() < pool.n_parallel_tasks:
+    async def _wait_for_drain(self) -> None:
+        """Wait for all in-flight rollout tasks to complete."""
+        while self._in_flight_tasks:
             await asyncio.sleep(0.1)
 
     async def _validate_async_with_pause(self, trainer_state: TrainerState, coordinator: SyncCoordinator) -> dict:
         """Validation with dispatch-level pause. Waits for workflows to drain, then runs validation."""
         coordinator.pause_generation()
-        await self._wait_for_all_workflows_idle()
+        await self._wait_for_drain()
         try:
             return await self._validate_async(trainer_state)
         finally:
@@ -701,6 +794,12 @@ class UnifiedTrainer:
 
     def shutdown(self):
         """Shutdown the trainer and cleanup resources."""
+        if hasattr(self, "_remote_runtime") and self._remote_runtime is not None:
+            self._remote_runtime.shutdown()
+            self._remote_runtime = None
+        if hasattr(self, "_gateway") and self._gateway is not None:
+            self._gateway.stop()
+            self._gateway = None
         if hasattr(self, "agent_workflow_engine") and self.agent_workflow_engine is not None:
             self.agent_workflow_engine.shutdown()
         self.backend.shutdown()
@@ -736,23 +835,23 @@ class TrainerLauncher(ABC):
 
     It handles the necessary environment setup (e.g. ray init for `verl`) for different backends. This is an abstract
     class that each backend must implement.
-
-    TODO(listar2000): add support to non-workflow training (e.g. agent/env classes), `fireworks` backend, and SDK.
     """
 
     def __init__(
         self,
         config: DictConfig,
-        workflow_class: type[Workflow],
+        workflow_class: type[Workflow] | None = None,
         train_dataset: Dataset | None = None,
         val_dataset: Dataset | None = None,
         workflow_args: dict | None = None,
+        store: Store | None = None,
         **kwargs,
     ):
         """Initialize the TrainerLauncher."""
         self.config = config
         self.workflow_class = workflow_class
         self.workflow_args = workflow_args or {}
+        self.store = store
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.kwargs = kwargs
@@ -768,18 +867,35 @@ class AgentTrainer:
     Adapted directly from `rllm.trainer.agent_trainer.AgentTrainer`.
 
     This trainer will simply delegate the task to the corresponding launcher class.
+
+    Provide exactly one of ``workflow_class`` or (``agent_flow`` AND ``evaluator``).
     """
 
     def __init__(
         self,
         config: DictConfig,
-        workflow_class: type[Workflow],
+        workflow_class: type[Workflow] | None = None,
         train_dataset: Dataset | None = None,
         val_dataset: Dataset | None = None,
         workflow_args: dict | None = None,
         backend: Literal["verl", "tinker", "fireworks"] = "verl",
+        agent_flow: Any = None,
+        evaluator: Any = None,
+        store: Store | None = None,
         **kwargs,
     ):
+        has_agent_flow = agent_flow is not None and evaluator is not None
+        remote_runtime_enabled = config.rllm.get("remote_runtime", {}).get("enabled", False)
+        if not has_agent_flow and not remote_runtime_enabled:
+            assert workflow_class is not None, "Either workflow_class, (agent_flow AND evaluator), or remote_runtime must be provided"
+
+        # Pass agent_flow and evaluator through kwargs for UnifiedTrainer
+        if agent_flow is not None:
+            kwargs["agent_flow"] = agent_flow
+        if evaluator is not None:
+            kwargs["evaluator"] = evaluator
+        kwargs["backend_name"] = backend
+
         if backend == "verl":
             from rllm.experimental.verl.verl_launcher import VerlTrainerLauncher
 
@@ -789,6 +905,7 @@ class AgentTrainer:
                 train_dataset=train_dataset,
                 val_dataset=val_dataset,
                 workflow_args=workflow_args,
+                store=store,
                 **kwargs,
             )
         elif backend == "tinker":
@@ -800,19 +917,7 @@ class AgentTrainer:
                 train_dataset=train_dataset,
                 val_dataset=val_dataset,
                 workflow_args=workflow_args,
-                **kwargs,
-            )
-        elif backend == "fireworks":
-            from rllm.trainer.fireworks.fireworks_launcher import (
-                FireworksTrainerLauncher,
-            )
-
-            self.launcher = FireworksTrainerLauncher(
-                config=config,
-                workflow_class=workflow_class,
-                train_dataset=train_dataset,
-                val_dataset=val_dataset,
-                workflow_args=workflow_args,
+                store=store,
                 **kwargs,
             )
 

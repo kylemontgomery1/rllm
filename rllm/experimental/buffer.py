@@ -11,6 +11,7 @@ import logging
 import os
 import pickle
 import tempfile
+from dataclasses import dataclass, field
 
 from rllm.agents.agent import Episode, TrajectoryGroup
 from rllm.experimental.common import (
@@ -28,8 +29,15 @@ from rllm.workflows.workflow import TerminationReason
 logger = logging.getLogger(__name__)
 
 
-# A task batch is all trajectory groups produced from one task's episodes.
-TaskBatch = list[TrajectoryGroup]
+_EPISODE_STRIP_KEYS = {"prompt_ids", "response_ids", "logprobs", "model_output", "routing_matrices"}
+_EPISODE_STRIP_LIST_DEFAULTS = {"prompt_ids", "response_ids", "logprobs"}
+
+
+@dataclass
+class TaskBatch:
+    """All trajectory groups produced from one task's episodes, plus stripped episodes for UI logging."""
+    groups: list[TrajectoryGroup]
+    episodes: list[Episode] = field(default_factory=list)
 
 
 class TrajectoryGroupBuffer:
@@ -153,7 +161,12 @@ class TrajectoryGroupBuffer:
         traj_groups, transform_metrics = transform_episodes_to_trajectory_groups(
             episodes, self._transform_config, self._cf_config,
         )
-        del episodes  # free memory
+        # Strip heavy fields from episodes for UI logging, free bulk memory
+        for ep in episodes:
+            for traj in ep.trajectories:
+                for step in traj.steps:
+                    for key in _EPISODE_STRIP_KEYS:
+                        setattr(step, key, [] if key in _EPISODE_STRIP_LIST_DEFAULTS else None)
         self._aggregator.record_dict(transform_metrics)
 
         # 3. Drop groups with too few trajectories
@@ -195,10 +208,11 @@ class TrajectoryGroupBuffer:
         for g in traj_groups:
             g.weight_version = weight_version
 
+        batch = TaskBatch(groups=traj_groups, episodes=episodes)
         if self._tg_offload_dir:
-            await self._queue.put(await self._offload_task_batch(traj_groups))
+            await self._queue.put(await self._offload_task_batch(batch))
         else:
-            await self._queue.put(traj_groups)
+            await self._queue.put(batch)
 
         return True
 

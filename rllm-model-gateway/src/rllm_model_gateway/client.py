@@ -37,6 +37,7 @@ class GatewayClient:
         self,
         session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        sampling_params: dict[str, Any] | None = None,
     ) -> str:
         """Create a session (or let the gateway generate an ID)."""
         body: dict[str, Any] = {}
@@ -44,6 +45,8 @@ class GatewayClient:
             body["session_id"] = session_id
         if metadata:
             body["metadata"] = metadata
+        if sampling_params:
+            body["sampling_params"] = sampling_params
         resp = self._http.post(f"{self.gateway_url}/sessions", json=body)
         resp.raise_for_status()
         return resp.json()["session_id"]
@@ -57,7 +60,9 @@ class GatewayClient:
         resp.raise_for_status()
         return resp.json()
 
-    def list_sessions(self, since: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_sessions(
+        self, since: float | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if since is not None:
             params["since"] = since
@@ -85,7 +90,9 @@ class GatewayClient:
             params["since"] = since
         if limit is not None:
             params["limit"] = limit
-        resp = self._http.get(f"{self.gateway_url}/sessions/{session_id}/traces", params=params)
+        resp = self._http.get(
+            f"{self.gateway_url}/sessions/{session_id}/traces", params=params
+        )
         resp.raise_for_status()
         data = resp.json()
         return [TraceRecord(**t) for t in data]
@@ -100,11 +107,12 @@ class GatewayClient:
     def add_worker(
         self,
         url: str,
+        api_path: str = "/v1",
         model_name: str | None = None,
         weight: int = 1,
     ) -> str:
         """Register a worker.  Returns worker_id."""
-        body: dict[str, Any] = {"url": url, "weight": weight}
+        body: dict[str, Any] = {"url": url, "api_path": api_path, "weight": weight}
         if model_name:
             body["model_name"] = model_name
         resp = self._http.post(f"{self.gateway_url}/admin/workers", json=body)
@@ -131,6 +139,20 @@ class GatewayClient:
         resp = self._http.get(f"{self.gateway_url}/health")
         resp.raise_for_status()
         return resp.json()
+
+    # -- Gate (weight sync) ------------------------------------------------
+
+    def close_gate(self) -> None:
+        resp = self._http.post(f"{self.gateway_url}/admin/gate/close")
+        resp.raise_for_status()
+
+    def open_gate(self) -> None:
+        resp = self._http.post(f"{self.gateway_url}/admin/gate/open")
+        resp.raise_for_status()
+
+    def wait_for_drain(self, timeout: float | None = None) -> None:
+        resp = self._http.post(f"{self.gateway_url}/admin/gate/drain", timeout=timeout)
+        resp.raise_for_status()
 
 
 class AsyncGatewayClient:
@@ -159,12 +181,15 @@ class AsyncGatewayClient:
         self,
         session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        sampling_params: dict[str, Any] | None = None,
     ) -> str:
         body: dict[str, Any] = {}
         if session_id:
             body["session_id"] = session_id
         if metadata:
             body["metadata"] = metadata
+        if sampling_params:
+            body["sampling_params"] = sampling_params
         resp = await self._http.post(f"{self.gateway_url}/sessions", json=body)
         resp.raise_for_status()
         return resp.json()["session_id"]
@@ -177,7 +202,9 @@ class AsyncGatewayClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def list_sessions(self, since: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+    async def list_sessions(
+        self, since: float | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if since is not None:
             params["since"] = since
@@ -205,7 +232,9 @@ class AsyncGatewayClient:
             params["since"] = since
         if limit is not None:
             params["limit"] = limit
-        resp = await self._http.get(f"{self.gateway_url}/sessions/{session_id}/traces", params=params)
+        resp = await self._http.get(
+            f"{self.gateway_url}/sessions/{session_id}/traces", params=params
+        )
         resp.raise_for_status()
         data = resp.json()
         return [TraceRecord(**t) for t in data]
@@ -220,10 +249,11 @@ class AsyncGatewayClient:
     async def add_worker(
         self,
         url: str,
+        api_path: str = "/v1",
         model_name: str | None = None,
         weight: int = 1,
     ) -> str:
-        body: dict[str, Any] = {"url": url, "weight": weight}
+        body: dict[str, Any] = {"url": url, "api_path": api_path, "weight": weight}
         if model_name:
             body["model_name"] = model_name
         resp = await self._http.post(f"{self.gateway_url}/admin/workers", json=body)
@@ -250,3 +280,17 @@ class AsyncGatewayClient:
         resp = await self._http.get(f"{self.gateway_url}/health")
         resp.raise_for_status()
         return resp.json()
+
+    # -- Gate (weight sync) ------------------------------------------------
+
+    async def close_gate(self) -> None:
+        resp = await self._http.post(f"{self.gateway_url}/admin/gate/close")
+        resp.raise_for_status()
+
+    async def open_gate(self) -> None:
+        resp = await self._http.post(f"{self.gateway_url}/admin/gate/open")
+        resp.raise_for_status()
+
+    async def wait_for_drain(self, timeout: float | None = None) -> None:
+        resp = await self._http.post(f"{self.gateway_url}/admin/gate/drain", timeout=timeout)
+        resp.raise_for_status()

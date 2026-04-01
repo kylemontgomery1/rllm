@@ -3,8 +3,8 @@ import base64
 import logging
 import os
 from io import BytesIO
+import json
 
-import json5
 import openai
 from PIL import Image
 
@@ -36,10 +36,10 @@ class OpenAIEngine(RolloutEngine):
             self._use_chat_completions = False
         else:
             # In this case, we cannot enforce max prompt length or dynamically adjust max_tokens <= max_response_length if needed
-            print(f"No tokenizer provided to OpenAIEngine, will use the chat completions endpoint for model {self.model}.")
+            print("No tokenizer provided to OpenAIEngine, will use the chat completions endpoint.")
             self._use_chat_completions = True
 
-        self.client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=3600)
+        self.client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
     @staticmethod
@@ -77,7 +77,7 @@ class OpenAIEngine(RolloutEngine):
             remaining = self.max_model_length - prompt_length
             if remaining <= max_tokens:
                 max_tokens = remaining
-                # print(f"Warning: Decreasing max_tokens to {max_tokens} to stay within max_model_length")
+                print(f"Warning: Decreasing max_tokens to {max_tokens} to stay within max_model_length")
 
         return {"max_tokens": max_tokens}
 
@@ -88,7 +88,7 @@ class OpenAIEngine(RolloutEngine):
         processed_tool_calls: list[ToolCall] = []
         for tool_call in tool_calls:
             try:
-                arguments = json5.loads(tool_call.function.arguments)
+                arguments = json.loads(tool_call.function.arguments)
             except Exception as e:
                 print(f"Error parsing tool call: {tool_call.function.arguments}, error: {e}")
                 continue
@@ -283,7 +283,7 @@ class OpenAIEngine(RolloutEngine):
                 print(f"Error: {e}, retrying...")
                 await asyncio.sleep(1)
 
-    async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
+    async def _get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
         if self._use_chat_completions:
             accumulate_reasoning = kwargs.pop("accumulate_reasoning", self.accumulate_reasoning)
             if accumulate_reasoning:
