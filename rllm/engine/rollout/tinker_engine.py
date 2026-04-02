@@ -5,7 +5,7 @@ from tinker.types import ModelInput
 from tinker_cookbook import model_info, renderers
 from typing_extensions import override  # need to use typing_extensions for python < 3.12
 
-from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngine
+from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngine, RolloutEngineConfig
 from rllm.engine.rollout.types import ImageProcessor, TinkerTokenInput, TinkerTokenOutput, TokenInput, Tokenizer, TokenOutput
 from rllm.parser.tinker_parser import TinkerChatTemplateParser
 from rllm.workflows import TerminationEvent, TerminationReason
@@ -230,13 +230,15 @@ class TinkerEngine(RolloutEngine):
             prompt_ids=prompt_ids,
             completion_ids=response_tokens,
             logprobs=logprobs,
+            routing_matrices=getattr(sampled_sequence, 'routing_matrices', None),
             prompt_length=_flat_token_input_length(token_input),
             completion_length=len(response_tokens),
             finish_reason=finish_reason,
+            metrics=getattr(sampled_sequence, 'server_metrics', None),
         )
 
     @override
-    async def _get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
+    async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
         """
         Generate model response for a given set of messages.
 
@@ -260,9 +262,60 @@ class TinkerEngine(RolloutEngine):
         tinker_prompt = self.chat_parser.build_prompt(messages, tools=tools)
         token_input: TinkerTokenInput = tinker_prompt.chunks
 
+        version = self.weight_version
         sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
-        return self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result.weight_version = version
+        return result
+
+    async def get_model_response_from_tokens(self, token_input: TokenInput, **kwargs) -> ModelOutput:
+        kwargs.pop("application_id", None)
+        version = self.weight_version
+        sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
+        result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
+        result.weight_version = version
+        return result
 
     async def compute_logprobs(self, ids: list[int]) -> list[float]:
         ids = ids[: self.max_model_length]
         return await self.sampling_client.compute_logprobs_async(ModelInput.from_ints(ids))
+
+    @classmethod
+    def from_config(cls, config: RolloutEngineConfig) -> "TinkerEngine":
+        """Construct a TinkerEngine from a RolloutEngineConfig.
+
+        Expected ``config.extra`` keys:
+            base_url: Tinker service URL.
+            model_name: Model name for renderer selection.
+            renderer_name (optional): Override renderer auto-detection.
+        """
+        from transformers import AutoProcessor, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+        base_url = config.extra.get("base_url", "")
+        model_name = config.extra.get("model_name", config.tokenizer_name)
+        service_client = tinker.ServiceClient(base_url) if base_url else tinker.ServiceClient()
+
+        image_processor = None
+        if "vl" in model_name.lower() or "vision" in model_name.lower():
+            try:
+                processor = AutoProcessor.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+                if hasattr(processor, "image_processor") and processor.image_processor is not None:
+                    image_processor = processor.image_processor
+            except Exception:
+                pass
+
+        extra_kwargs = {k: v for k, v in config.extra.items() if k not in ("base_url", "model_name", "renderer_name")}
+        return cls(
+            model_name=model_name,
+            tokenizer=tokenizer,
+            service_client=service_client,
+            base_url=base_url,
+            max_prompt_length=config.max_prompt_length,
+            max_response_length=config.max_response_length,
+            max_model_length=config.max_model_length,
+            sampling_params=config.sampling_params,
+            renderer_name=config.extra.get("renderer_name"),
+            image_processor=image_processor,
+            **extra_kwargs,
+        )

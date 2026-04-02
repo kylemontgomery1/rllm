@@ -197,8 +197,8 @@ class FireworksBackend(TinkerBackend):
                     f"Use a training shape with PP=1."
                 )
 
-        deployment_id = deploy.deployment_id
         dep_info = setup_deployment(deploy_mgr, deploy, cfg.model.name, infra)
+        deployment_id = deploy.deployment_id
         self._cleanup.deployment(deployment_id, action="delete")
 
         kl_beta = cfg.rllm.algorithm.get("kl_beta", 0.0)
@@ -268,17 +268,30 @@ class FireworksBackend(TinkerBackend):
             policy_job_id=self._policy_job_id,
         )
 
-        self.rollout_engine = FireworksEngine(
-            tokenizer=self.tokenizer,
-            sampler=self.sampling_client,
-            max_prompt_length=self.full_config.data.max_prompt_length,
-            max_response_length=self.full_config.data.max_response_length,
-            max_model_length=self.full_config.training.max_length,
-            sampling_params=self.full_config.sampling,
-            sample_timeout=self.full_config.deployment.get("sample_timeout", 600),
-            router_replay=self.full_config.rllm.algorithm.get("router_replay", False),
-            **self.full_config.get("rollout_engine", {}),
+        from rllm.engine.rollout.rollout_engine import RolloutEngineConfig
+
+        cfg = self.full_config
+        rollout_extra = dict(cfg.get("rollout_engine", {}))
+        self.rollout_engine_cls = FireworksEngine
+        self.rollout_engine_config = RolloutEngineConfig(
+            tokenizer_name=cfg.deployment.get("tokenizer_model") or cfg.model.name,
+            max_prompt_length=cfg.data.max_prompt_length,
+            max_response_length=cfg.data.max_response_length,
+            max_model_length=cfg.training.max_length,
+            sampling_params=dict(cfg.sampling),
+            disable_thinking=rollout_extra.pop("disable_thinking", False),
+            accumulate_reasoning=rollout_extra.pop("accumulate_reasoning", False),
+            reasoning_effort=rollout_extra.pop("reasoning_effort", "medium"),
+            extra={
+                "api_key": os.environ["FIREWORKS_API_KEY"],
+                "inference_url": self._deploy_mgr.inference_url,
+                "model": self.sampling_client.model,
+                "sample_timeout": cfg.deployment.get("sample_timeout", 600),
+                "router_replay": cfg.rllm.algorithm.get("router_replay", False),
+                **rollout_extra,
+            },
         )
+        self.rollout_engine = FireworksEngine.from_config(self.rollout_engine_config)
         return self.rollout_engine
 
     def validate_config(self) -> None:

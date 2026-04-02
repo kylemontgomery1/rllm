@@ -25,12 +25,12 @@ from fireworks.training.sdk import DeploymentSampler
 
 from typing_extensions import override
 
-from rllm.experimental.rollout.rollout_engine import ModelOutput
-from rllm.experimental.rollout.tinker_engine import (
+from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngineConfig
+from rllm.engine.rollout.tinker_engine import (
     TinkerEngine,
     _flat_token_input_length,
 )
-from rllm.experimental.rollout.types import (
+from rllm.engine.rollout.types import (
     TinkerTokenInput,
     TinkerTokenOutput,
     Tokenizer,
@@ -107,7 +107,7 @@ class FireworksEngine(TinkerEngine):
             router_replay: If True, request and propagate routing matrices
                 for Router Replay (R3) training.
         """
-        from rllm.experimental.rollout.rollout_engine import RolloutEngine
+        from rllm.engine.rollout.rollout_engine import RolloutEngine
         from rllm.parser import ChatTemplateParser
 
         # Skip TinkerEngine.__init__ (it requires tinker.ServiceClient);
@@ -318,3 +318,37 @@ class FireworksEngine(TinkerEngine):
                 )
                 raise
         raise RuntimeError("unreachable")
+
+    @classmethod
+    def from_config(cls, config: RolloutEngineConfig) -> "FireworksEngine":
+        """Construct a FireworksEngine from a RolloutEngineConfig.
+
+        Expected ``config.extra`` keys:
+            api_key: Fireworks API key.
+            inference_url: Fireworks inference endpoint.
+            model: Model identifier for the deployment.
+            sample_timeout (optional): HTTP timeout in seconds (default 600).
+            router_replay (optional): Enable R3 routing matrices (default False).
+        """
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+        sampler = DeploymentSampler(
+            inference_url=config.extra["inference_url"],
+            model=config.extra["model"],
+            api_key=config.extra["api_key"],
+            tokenizer=tokenizer,
+        )
+        return cls(
+            tokenizer=tokenizer,
+            sampler=sampler,
+            max_prompt_length=config.max_prompt_length,
+            max_response_length=config.max_response_length,
+            max_model_length=config.max_model_length,
+            sampling_params=config.sampling_params,
+            disable_thinking=config.disable_thinking,
+            accumulate_reasoning=config.accumulate_reasoning,
+            reasoning_effort=config.reasoning_effort,
+            sample_timeout=config.extra.get("sample_timeout", 600),
+            router_replay=config.extra.get("router_replay", False),
+        )

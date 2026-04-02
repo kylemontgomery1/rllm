@@ -325,7 +325,7 @@ class FireworksPolicyTrainer:
                 if k not in self._METRIC_SKIP_KEYS:
                     adv_metrics[f"train/{k}"] = v
 
-        return training_datums, training_logprobs, adv_metrics
+        return clean_datums, training_logprobs, adv_metrics
 
     # ------------------------------------------------------------------
     # Optimizer step

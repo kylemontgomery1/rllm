@@ -225,17 +225,38 @@ class UnifiedTrainer:
                 episode_logger=self.episode_logger,
             )
         else:
-            self.agent_workflow_engine = UnifiedWorkflowEngine(
-                workflow_cls=self.workflow_class,
-                workflow_args=self.workflow_args,
-                rollout_engine=rollout_engine,
-                config=self.config,
-                n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
-                retry_limit=self.rllm_config.workflow.retry_limit,
-                raise_on_error=self.rllm_config.workflow.raise_on_error,
-                episode_logger=self.episode_logger,
-                store=self.store,
-            )
+            n_workers = self.rllm_config.workflow.get("n_workers", 1)
+            if n_workers > 1:
+                from rllm.experimental.engine.multiprocess_workflow_engine import MultiProcessWorkflowEngine
+
+                assert hasattr(self.backend, "rollout_engine_cls") and hasattr(self.backend, "rollout_engine_config"), (
+                    f"Backend {type(self.backend).__name__} does not support n_workers > 1. "
+                    "It must store rollout_engine_cls and rollout_engine_config during init_rollout_engine()."
+                )
+                self.agent_workflow_engine = MultiProcessWorkflowEngine(
+                    workflow_cls=self.workflow_class,
+                    workflow_args=self.workflow_args,
+                    rollout_engine_cls=self.backend.rollout_engine_cls,
+                    rollout_config=self.backend.rollout_engine_config,
+                    n_workers=n_workers,
+                    n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
+                    retry_limit=self.rllm_config.workflow.retry_limit,
+                    raise_on_error=self.rllm_config.workflow.raise_on_error,
+                    episode_logger=self.episode_logger,
+                    store=self.store,
+                )
+            else:
+                self.agent_workflow_engine = UnifiedWorkflowEngine(
+                    workflow_cls=self.workflow_class,
+                    workflow_args=self.workflow_args,
+                    rollout_engine=rollout_engine,
+                    config=self.config,
+                    n_parallel_tasks=self.rllm_config.workflow.n_parallel_tasks,
+                    retry_limit=self.rllm_config.workflow.retry_limit,
+                    raise_on_error=self.rllm_config.workflow.raise_on_error,
+                    episode_logger=self.episode_logger,
+                    store=self.store,
+                )
 
         self.tokenizer = None
         if hasattr(self.backend, "tokenizer"):
@@ -563,7 +584,6 @@ class UnifiedTrainer:
         fwd_bwd_group_size = self.async_config.fwd_bwd_group_size
         num_fwd_bwd_passes = mini_batch_size // fwd_bwd_group_size
         use_total_batches = self.rllm_config.trainer.get("total_batches", -1) > 0
-        rollout_engine = getattr(self.agent_workflow_engine, "rollout_engine", None)
 
         while True:
             trainer_state.reset_batch()
@@ -624,7 +644,7 @@ class UnifiedTrainer:
             sync_time = 0.0
             if coordinator.should_sync():
                 t0 = time.perf_counter()
-                await self._perform_weight_sync(trainer_state, coordinator, rollout_engine)
+                await self._perform_weight_sync(trainer_state, coordinator)
                 sync_time = time.perf_counter() - t0
 
             # 4. Record training-loop metrics to aggregator
@@ -674,23 +694,25 @@ class UnifiedTrainer:
             if use_total_batches and trainer_state.global_step >= self.rllm_config.trainer.total_batches:
                 break
 
-    async def _perform_weight_sync(self, trainer_state: TrainerState, coordinator: SyncCoordinator, rollout_engine: RolloutEngine | None) -> None:
+    async def _perform_weight_sync(self, trainer_state: TrainerState, coordinator: SyncCoordinator) -> None:
         """Synchronize weights between training and rollout engines.
 
         Gating behavior depends on backend.needs_weight_sync_gate:
         - False (e.g. Tinker): skip gating, just update weights in-place.
-        - True + partial_rollout=True: gate at model-call level (rollout engine or gateway).
+        - True + partial_rollout=True: gate at model-call level (engine or gateway).
           Workflows block between turns, resume with new weights.
         - True + partial_rollout=False: pause at dispatch level (coordinator).
           Workflows finish naturally, gate stays open.
         """
-        gateway = getattr(self.agent_workflow_engine, "gateway", None)
+        engine = self.agent_workflow_engine
+        has_gate = hasattr(engine, "close_gate")
+        gateway = getattr(engine, "gateway", None)
 
         if self.async_config.partial_rollout:
             if self.backend.needs_weight_sync_gate:
-                if rollout_engine is not None:
-                    rollout_engine.close_gate()
-                    await rollout_engine.wait_for_drain()
+                if has_gate:
+                    engine.close_gate()
+                    await engine.wait_for_drain()
                 elif gateway is not None:
                     gateway.close_gate()
                     await gateway.wait_for_drain()
@@ -700,14 +722,14 @@ class UnifiedTrainer:
 
         trainer_state.policy_version = coordinator.policy_version + 1
         await self.backend.on_policy_updated(trainer_state)
-        if rollout_engine is not None:
-            rollout_engine.weight_version = trainer_state.policy_version
+        if has_gate:
+            engine.set_weight_version(trainer_state.policy_version)
         coordinator.on_sync_complete()
 
         if self.async_config.partial_rollout:
             if self.backend.needs_weight_sync_gate:
-                if rollout_engine is not None:
-                    rollout_engine.open_gate()
+                if has_gate:
+                    engine.open_gate()
                 elif gateway is not None:
                     gateway.open_gate()
         else:
@@ -920,6 +942,20 @@ class AgentTrainer:
                 store=store,
                 **kwargs,
             )
+        elif backend == "fireworks":
+            from rllm.trainer.fireworks.fireworks_launcher import FireworksTrainerLauncher
+
+            self.launcher = FireworksTrainerLauncher(
+                config=config,
+                workflow_class=workflow_class,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                workflow_args=workflow_args,
+                store=store,
+                **kwargs,
+            )
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
 
     def train(self):
         self.launcher.train()

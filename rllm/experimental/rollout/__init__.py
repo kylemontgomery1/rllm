@@ -40,7 +40,7 @@ def __getattr__(name):
         except Exception:
             raise AttributeError(name) from None
     if name == "FireworksEngine":
-        from rllm.engine.rollout.fireworks_engine import FireworksEngine as _FireworksEngine
+        from rllm.experimental.rollout.fireworks_engine import FireworksEngine as _FireworksEngine
 
         return _FireworksEngine
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

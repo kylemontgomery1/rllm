@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -33,6 +35,7 @@ class AgentWorkflowEngine:
         retry_limit: int = 3,
         raise_on_error: bool = True,
         episode_logger=None,
+        output_dir: str | None = None,
         **kwargs,
     ):
         """Initialize the AgentWorkflowEngine.
@@ -46,6 +49,7 @@ class AgentWorkflowEngine:
             retry_limit: Maximum number of retry attempts for failed tasks.
             raise_on_error: Whether to raise exceptions on permanent failures.
             episode_logger: Optional logger for saving episode data to files.
+            output_dir: Optional directory for per-episode JSON output.
             **kwargs: Additional keyword arguments.
         """
         self.workflow_cls = workflow_cls
@@ -63,6 +67,7 @@ class AgentWorkflowEngine:
         self.workflow_queue = None
 
         # Episode logging support
+        self.output_dir = Path(output_dir) if output_dir else None
         self.episode_logger = episode_logger
         self.current_step = 0
         self.current_epoch = 0
@@ -148,16 +153,29 @@ class AgentWorkflowEngine:
         finally:
             await self.workflow_queue.put(workflow)
 
-    async def execute_tasks(self, tasks: list[dict], task_ids: list[str] | None = None, **kwargs) -> list[Episode]:
+    async def execute_tasks(
+        self,
+        tasks: list[dict],
+        task_ids: list[str] | None = None,
+        post_process_fn=None,
+        keep_in_memory: bool = True,
+        rollout_offset: int = 0,
+        **kwargs,
+    ) -> list[Episode]:
         """Run asynchronous workflow execution with retry logic for multiple tasks.
 
         Args:
             tasks: List of task dictionaries to process.
             task_ids: Optional list of task identifiers. If None, UUIDs are generated.
+            post_process_fn: Optional callable(Episode) -> dict for serialization.
+                Only used when output_dir is set. Converts an episode to the dict
+                that gets written to disk.
+            keep_in_memory: If False, don't accumulate episodes in memory.
+            rollout_offset: Starting rollout index (for resuming across epochs).
             **kwargs: Additional arguments passed to individual task processing.
 
         Returns:
-            list[Episode]: List of completed episodes from all tasks.
+            list[Episode]: List of completed episodes (empty if keep_in_memory=False).
         """
         if self.workflow_queue is None:
             await self.initialize_pool()
@@ -165,7 +183,7 @@ class AgentWorkflowEngine:
         if task_ids is None:
             task_ids = [str(uuid.uuid4()) for _ in tasks]
 
-        task_states = defaultdict(lambda: {"idx": None, "task": None, "episodes": [], "completed": 0, "total_rollouts": 0, "is_complete": False})
+        task_states = defaultdict(lambda: {"idx": None, "task": None, "episodes": [], "completed": 0, "total_rollouts": rollout_offset, "is_complete": False})
 
         futures = []
         idx_counter = 0
@@ -183,10 +201,25 @@ class AgentWorkflowEngine:
             for future in asyncio.as_completed(futures):
                 task_id, rollout_idx, episode = await future
 
-                state = task_states[task_id]
-                state["episodes"].append(episode)
-                state["completed"] += 1
+                if self.output_dir is not None:
+                    try:
+                        self.output_dir.mkdir(parents=True, exist_ok=True)
+                        serialize = post_process_fn or (lambda ep: ep.to_dict())
+                        episode_data = serialize(episode)
+                        episode_path = self.output_dir / f"{task_id}:{rollout_idx}.json"
+                        with open(episode_path, "w") as f:
+                            json.dump(episode_data, f, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(f"Failed to save episode {task_id}:{rollout_idx}: {e}")
+
+                if keep_in_memory:
+                    task_states[task_id]["episodes"].append(episode)
+
+                task_states[task_id]["completed"] += 1
                 pbar.update(1)
+
+        if not keep_in_memory:
+            return []
 
         results = []
         sorted_tasks = sorted(task_states.keys(), key=lambda task_id: task_states[task_id]["idx"])

@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from .rollout_engine import ModelOutput, RolloutEngine
+from .rollout_engine import ModelOutput, RolloutEngine, RolloutEngineConfig
 from .types import TinkerTokenInput, TinkerTokenOutput, TokenInput, Tokenizer, TokenOutput, VerlTokenInput, VerlTokenOutput
 
 if TYPE_CHECKING:
@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ModelOutput",
     "RolloutEngine",
+    "RolloutEngineConfig",
     "OpenAIEngine",
     "TinkerEngine",
     "VerlEngine",

@@ -150,12 +150,17 @@ class VerlBackend(BackendProtocol[Iterable, DataProto], RayPPOTrainer):
         assert self.async_rollout_manager is not None, "async_rollout_manager is not available. Issues with RayPPOTrainer's `init_workers()` function."
 
         # Step 2: initialize the rollout engine
-        self.rollout_engine = VerlEngine(
-            config=self.config,
-            rollout_manager=self.async_rollout_manager,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
+        from rllm.engine.rollout.rollout_engine import RolloutEngineConfig
+
+        self.rollout_engine_cls = VerlEngine
+        self.rollout_engine_config = RolloutEngineConfig(
+            tokenizer_name=self.full_config.model.name,
+            extra={
+                "config": self.config,
+                "rollout_manager": self.async_rollout_manager,
+            },
         )
+        self.rollout_engine = VerlEngine.from_config(self.rollout_engine_config)
 
         # Step 3: store the algorithm config
         self.algorithm_config = kwargs.get("algorithm_config")

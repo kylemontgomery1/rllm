@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from tqdm import tqdm
@@ -73,6 +75,7 @@ class UnifiedWorkflowEngine:
         self.n_parallel_tasks = n_parallel_tasks
         self.executor = ThreadPoolExecutor(max_workers=self.n_parallel_tasks)
         self.workflow_queue = None
+        self.output_dir = Path(kwargs["output_dir"]) if kwargs.get("output_dir") is not None else None
 
         # Post-execute hook (e.g. SDK trace flushing)
         self.post_execute_hook = post_execute_hook
@@ -179,16 +182,27 @@ class UnifiedWorkflowEngine:
         finally:
             await self.workflow_queue.put(workflow)
 
-    async def execute_tasks(self, tasks: list[dict], task_ids: list[str] | None = None, is_validation: bool = False, **kwargs) -> list[Episode]:
+    async def execute_tasks(
+        self,
+        tasks: list[dict],
+        task_ids: list[str] | None = None,
+        is_validation: bool = False,
+        post_process_fn=None,
+        keep_in_memory: bool = True,
+        **kwargs,
+    ) -> list[Episode]:
         """Run asynchronous workflow execution with retry logic for multiple tasks.
         Args:
             tasks: List of task dictionaries to process.
             task_ids: Optional list of task identifiers. If None, UUIDs are generated.
             is_validation: Whether the generation is for validation.
+            post_process_fn: Optional callable(Episode) -> dict for serialization.
+                Only used when output_dir is set.
+            keep_in_memory: If False, don't accumulate episodes in memory.
             **kwargs: Additional arguments passed to individual task processing.
 
         Returns:
-            list[Episode]: List of completed episodes from all tasks.
+            list[Episode]: List of completed episodes (empty if keep_in_memory=False).
         """
         if self.workflow_queue is None:
             await self.initialize_pool()
@@ -202,18 +216,42 @@ class UnifiedWorkflowEngine:
         task_id_counter = defaultdict(int)
         # pre-allocate results
         results = [None] * len(tasks)
+        skipped = 0
 
         futures = []
         for idx, (task, task_id) in enumerate(zip(tasks, task_ids, strict=True)):
             rollout_idx = task_id_counter[task_id]
-            futures.append(self.process_task_with_retry(task, task_id, rollout_idx, idx, **kwargs))
             task_id_counter[task_id] += 1
+            if self.output_dir is not None and (self.output_dir / f"{task_id}:{rollout_idx}.json").exists():
+                skipped += 1
+                continue
+            futures.append(self.process_task_with_retry(task, task_id, rollout_idx, idx, **kwargs))
 
-        with tqdm(total=len(tasks), desc="Generating trajectories") as pbar:
+        if skipped:
+            logger.info(f"Skipped {skipped} tasks with existing output files")
+
+        with tqdm(total=len(futures), desc="Generating trajectories") as pbar:
             for future in asyncio.as_completed(futures):  # the completion order might not be ordered
                 task_id, rollout_idx, idx, episode = await future
-                results[idx] = episode
+
+                if self.output_dir is not None:
+                    try:
+                        self.output_dir.mkdir(parents=True, exist_ok=True)
+                        serialize = post_process_fn or (lambda ep: ep.to_dict())
+                        episode_data = serialize(episode)
+                        episode_path = self.output_dir / f"{task_id}:{rollout_idx}.json"
+                        with open(episode_path, "w") as f:
+                            json.dump(episode_data, f, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(f"Failed to save episode {task_id}:{rollout_idx}: {e}")
+
+                if keep_in_memory:
+                    results[idx] = episode
+
                 pbar.update(1)
+
+        if not keep_in_memory:
+            return []
 
         # Invoke post-execute hook (e.g. batch-level SDK trace flush)
         if self.post_execute_hook is not None:
@@ -259,6 +297,20 @@ class UnifiedWorkflowEngine:
             for episode, data_source in zip(episodes, data_sources, strict=True):
                 episode.info["data_source"] = data_source
         return episodes
+
+    # --- Gate/sync delegation (matches MultiProcessWorkflowEngine interface) ---
+
+    def close_gate(self):
+        self.rollout_engine.close_gate()
+
+    def open_gate(self):
+        self.rollout_engine.open_gate()
+
+    async def wait_for_drain(self):
+        await self.rollout_engine.wait_for_drain()
+
+    def set_weight_version(self, version: int):
+        self.rollout_engine.weight_version = version
 
     def shutdown(self):
         """Shutdown the workflow engine and cleanup resources."""

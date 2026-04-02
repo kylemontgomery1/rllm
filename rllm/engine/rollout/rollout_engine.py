@@ -1,9 +1,32 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from rllm.engine.rollout.types import TokenInput, Tokenizer, TokenOutput
 from rllm.parser import ChatTemplateParser
 from rllm.tools.tool_base import ToolCall
+
+
+@dataclass
+class RolloutEngineConfig:
+    """Generic, serializable config for constructing a RolloutEngine.
+
+    Common fields cover parameters shared across all engines. Engine-specific
+    values (API keys, URLs, model identifiers, etc.) go in ``extra``.
+
+    Each engine subclass implements ``from_config(cls, config)`` to build
+    itself from this config.
+    """
+
+    tokenizer_name: str = ""
+    max_prompt_length: int = 4096
+    max_response_length: int = 8192
+    max_model_length: int = 131072
+    sampling_params: dict | None = None
+    disable_thinking: bool = False
+    accumulate_reasoning: bool = False
+    reasoning_effort: str = "medium"
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -22,6 +45,7 @@ class ModelOutput:
     completion_length: int = 0
     finish_reason: str | None = None
     weight_version: int | None = None  # policy version at time of generation
+    metrics: dict | None = None  # per-turn server metrics (e.g. ttft, queue durations)
 
     def to_dict(self):
         return {
@@ -38,6 +62,7 @@ class ModelOutput:
             "completion_length": self.completion_length,
             "finish_reason": self.finish_reason,
             "weight_version": self.weight_version,
+            "metrics": self.metrics,
         }
 
     @classmethod
@@ -56,6 +81,7 @@ class ModelOutput:
             completion_length=data.get("completion_length", 0),
             finish_reason=data.get("finish_reason"),
             weight_version=data.get("weight_version"),
+            metrics=data.get("metrics"),
         )
 
 
@@ -100,18 +126,8 @@ class RolloutEngine:
         """Wait until all active model calls complete. Used during weight sync."""
         await self._drained_event.wait()
 
-    # --- Model response ---
-    async def _get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
-        raise NotImplementedError(f"_get_model_response is not implemented for {self.__class__.__name__}")
-
     async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
-        await self.wait_for_gate()
-        try:
-            result = await self._get_model_response(messages, **kwargs)
-            result.weight_version = self.weight_version
-            return result
-        finally:
-            self.on_model_call_complete()
+        raise NotImplementedError("get_model_response is not implemented")
 
     def assemble_model_output(self, token_input: TokenInput, token_output: TokenOutput) -> ModelOutput:
         """
