@@ -50,6 +50,27 @@ def _worker_main(
     ))
 
 
+async def _event_loop_probe(worker_id: int, interval_s: float = 60):
+    """Log event loop latency stats every interval_s seconds."""
+    import time
+    import numpy as np
+    buf = []
+    last_log = time.perf_counter()
+    while True:
+        t0 = time.perf_counter()
+        await asyncio.sleep(0.01)
+        buf.append(time.perf_counter() - t0 - 0.01)
+        if time.perf_counter() - last_log >= interval_s and buf:
+            arr = np.array(buf)
+            logger.info(
+                "Worker %d event loop probe (last %ds): n=%d, mean=%.3fs, p50=%.3fs, p90=%.3fs, p99=%.3fs, max=%.3fs",
+                worker_id, interval_s, len(arr), np.mean(arr), np.median(arr),
+                np.percentile(arr, 90), np.percentile(arr, 99), np.max(arr),
+            )
+            buf.clear()
+            last_log = time.perf_counter()
+
+
 async def _worker_async_main(
     worker_id: int,
     rollout_engine_cls: type,
@@ -68,6 +89,8 @@ async def _worker_async_main(
     """Async main loop for a worker process."""
     from rllm.experimental.engine.unified_workflow_engine import UnifiedWorkflowEngine
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", force=True)
+
     # Build rollout engine from config
     rollout_engine = rollout_engine_cls.from_config(rollout_config)
 
@@ -83,6 +106,7 @@ async def _worker_async_main(
     )
     await engine.initialize_pool()
 
+    probe = asyncio.create_task(_event_loop_probe(worker_id))
     logger.info("Worker %d initialized: %d parallel tasks", worker_id, n_parallel_tasks)
 
     active_tasks: set[asyncio.Task] = set()
@@ -131,6 +155,7 @@ async def _worker_async_main(
             if t.exception():
                 logger.error("Worker %d drain exception: %s", worker_id, t.exception())
 
+    probe.cancel()
     logger.info("Worker %d shut down", worker_id)
 
 

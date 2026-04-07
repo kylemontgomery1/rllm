@@ -838,7 +838,9 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
                 for tc in tool_calls:
                     name = tc.name if hasattr(tc, "name") else tc["name"]
                     args = tc.arguments if hasattr(tc, "arguments") else tc["arguments"]
-                    if not args and tc.metadata and "raw_arguments" in tc.metadata:
+                    if name.startswith("python") and isinstance(args, dict) and "code" in args:
+                        dumped_args = args["code"]
+                    elif not args and tc.metadata and "raw_arguments" in tc.metadata:
                         dumped_args = tc.metadata["raw_arguments"]
                     else:
                         dumped_args = json.dumps(args)
@@ -904,13 +906,16 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
                     recipient = channel
                     is_builtin = recipient.startswith(("browser", "python"))
                     channel = "analysis" if is_builtin else "commentary"
-                try:
-                    arguments = json5.loads(text) if text.strip() else {}
-                    if not isinstance(arguments, dict):
-                        raise ValueError(f"parsed arguments is {type(arguments).__name__}, not dict")
-                    tool_calls.append(ToolCall(name=recipient, arguments=arguments))
-                except Exception:
-                    tool_calls.append(ToolCall(name=recipient, arguments={}, metadata={"raw_arguments": text}))
+                if recipient.startswith("python"):
+                    tool_calls.append(ToolCall(name=recipient, arguments={"code": text}))
+                else:
+                    try:
+                        arguments = json5.loads(text) if text.strip() else {}
+                        if not isinstance(arguments, dict):
+                            raise ValueError(f"parsed arguments is {type(arguments).__name__}, not dict")
+                        tool_calls.append(ToolCall(name=recipient, arguments=arguments))
+                    except Exception:
+                        tool_calls.append(ToolCall(name=recipient, arguments={}, metadata={"raw_arguments": text}))
             elif channel == "analysis":
                 reasoning += text
             elif channel == "final":
