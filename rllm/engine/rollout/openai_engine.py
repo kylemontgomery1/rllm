@@ -221,7 +221,7 @@ class OpenAIEngine(RolloutEngine):
         retries = self.api_retries
         while retries > 0:
             try:
-                response = await self.client.completions.create(model=self.model, prompt=prompt, **sampling_params)
+                response = await self.client.completions.create(model=self.model, prompt=prompt, timeout=3600, **sampling_params)
                 text = response.choices[0].text
                 try:
                     completion_ids = response.choices[0].token_ids
@@ -300,3 +300,23 @@ class OpenAIEngine(RolloutEngine):
         ids = ids[: self.max_model_length]
         output = await self.completion(ids, max_tokens=1, echo=True, logprobs=1, temperature=1.0, top_p=1.0)
         return output.prompt_logprobs
+
+    @classmethod
+    def from_config(cls, config: "RolloutEngineConfig") -> "OpenAIEngine":
+        from transformers import AutoTokenizer
+        from rllm.engine.rollout.rollout_engine import RolloutEngineConfig
+
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+        sampling_params = (config.sampling_params or {}).get("train", {})
+        return cls(
+            model=config.extra["model"],
+            tokenizer=tokenizer,
+            max_prompt_length=config.max_prompt_length,
+            max_response_length=config.max_response_length,
+            max_model_length=config.max_model_length,
+            base_url=config.extra.get("base_url", "https://api.openai.com/v1"),
+            api_key=config.extra.get("api_key", os.getenv("OPENAI_API_KEY")),
+            sampling_params=sampling_params,
+            accumulate_reasoning=config.accumulate_reasoning,
+            disable_thinking=config.disable_thinking,
+        )

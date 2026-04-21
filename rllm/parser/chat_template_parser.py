@@ -375,6 +375,9 @@ class DeepseekQwenChatTemplateParser(ChatTemplateParser):
 
 
 class QwenChatTemplateParser(ChatTemplateParser):
+    def _get_generation_prompt(self, tokenizer):
+        return ""  # placeholder; __init__ overwrites with self.assistant_token
+
     def __init__(self, tokenizer, processor=None, disable_thinking=False):
         super().__init__(tokenizer, processor=processor)
         self.disable_thinking = disable_thinking

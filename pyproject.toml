@@ -89,7 +89,7 @@ verl = [
     "transformers>=4.55.0,<5.0.0",
     "numpy",
     "torch",
-    "torchvision,
+    "torchvision",
     "flash-attn>=2.8.1",
     "qwen-vl-utils",
     "ray",
@@ -169,6 +169,7 @@ deepresearch = [
 
 [tool.uv.sources]
 rllm-model-gateway = { path = "./rllm-model-gateway", editable = true }
+tinker-cookbook = { git = "https://github.com/thinking-machines-lab/tinker-cookbook.git", tag = "v0.2.1" }
 
 [tool.uv]
 override-dependencies = [

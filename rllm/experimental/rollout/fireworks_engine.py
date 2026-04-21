@@ -312,9 +312,10 @@ class FireworksEngine(TinkerEngine):
                     )
                     await asyncio.sleep(wait)
                     continue
+                resp_text = getattr(getattr(exc, 'response', None), 'text', None)
                 logger.error(
-                    "Sampling failed permanently after %d attempts: %s",
-                    attempt + 1, exc,
+                    "Sampling failed permanently after %d attempts: %s\n%s",
+                    attempt + 1, exc, resp_text or "",
                 )
                 raise
         raise RuntimeError("unreachable")
