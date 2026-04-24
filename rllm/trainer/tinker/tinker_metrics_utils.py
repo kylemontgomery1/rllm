@@ -92,8 +92,8 @@ def update_training_metrics(trainer_state: TrainerState, learning_rate: float, t
     # env_metrics = compute_env_metrics(episodes)
     # metrics.update(env_metrics)
 
-    # TODO: KL/entropy metrics disabled — datum format differs between Tinker and Fireworks backends
-    # if "training_logprobs" in trainer_state.extra_info:
-    #     training_datums = trainer_state.backend_batch
-    #     training_logprobs = trainer_state.extra_info["training_logprobs"]
-    #     metrics.update(compute_kl_and_entropy_metrics(training_datums, training_logprobs))  # type: ignore[arg-type]
+    # TODO(kylemontgomery1): datum format differs between Tinker and Fireworks backends
+    if "training_logprobs" in trainer_state.extra_info:
+        training_datums = trainer_state.backend_batch
+        training_logprobs = trainer_state.extra_info["training_logprobs"]
+        metrics.update(compute_kl_and_entropy_metrics(training_datums, training_logprobs))  # type: ignore[arg-type]

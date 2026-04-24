@@ -2,8 +2,6 @@ import json
 from abc import ABC, abstractmethod
 from typing import Any
 
-import json5
-
 from rllm.tools.tool_base import ToolCall
 
 
@@ -272,6 +270,8 @@ For each function call, return a json object with function name and arguments wi
 
 class TongyiDeepResearchToolParser(QwenToolParser):
     def parse_qwen_tool_calls(self, text: str) -> list[dict[str, Any]]:
+        import json5
+
         """Parse tool calls from text using a simple token format.
         Note the only difference compared to QwenToolParser is that we don't expect a trailing </tool_call>,
         since we use </tool_call> as a stop token.
@@ -293,7 +293,7 @@ class TongyiDeepResearchToolParser(QwenToolParser):
         if self.tool_call_begin not in text:
             # Try to parse as JSON
             try:
-                call_data = json5.loads(content)
+                call_data = json5.loads(text)
                 if "name" in call_data and "arguments" in call_data:
                     tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
                     return tool_calls

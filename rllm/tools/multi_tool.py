@@ -1,4 +1,4 @@
-from rllm.tools.registry import ToolRegistry
+from rllm.tools import tool_registry
 from rllm.tools.tool_base import Tool, ToolOutput
 
 
@@ -23,11 +23,10 @@ class MultiTool(Tool):
                 self.tool_map[name] = tool_cls(name=name)
         elif tools is not None:
             # Legacy behavior: look up tools in registry
-            registry = ToolRegistry()
-            assert all(tool in registry for tool in tools), "All tools must be in the registry"
+            assert all(tool in tool_registry for tool in tools), "All tools must be in the registry"
             self.tools = tools
-            # Filter out None values from registry.instantiate
-            self.tool_map = {tool: tool_instance for tool in tools if (tool_instance := registry.instantiate(tool)) is not None}
+            # Filter out None values from tool_registry.instantiate
+            self.tool_map = {tool: tool_instance for tool in tools if (tool_instance := tool_registry.instantiate(tool)) is not None}
         else:
             # Default to empty
             self.tools = []
