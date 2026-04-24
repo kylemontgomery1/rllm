@@ -159,7 +159,6 @@ class AgentWorkflowEngine:
         task_ids: list[str] | None = None,
         post_process_fn=None,
         keep_in_memory: bool = True,
-        rollout_offset: int = 0,
         **kwargs,
     ) -> list[Episode]:
         """Run asynchronous workflow execution with retry logic for multiple tasks.
@@ -171,7 +170,6 @@ class AgentWorkflowEngine:
                 Only used when output_dir is set. Converts an episode to the dict
                 that gets written to disk.
             keep_in_memory: If False, don't accumulate episodes in memory.
-            rollout_offset: Starting rollout index (for resuming across epochs).
             **kwargs: Additional arguments passed to individual task processing.
 
         Returns:
@@ -183,10 +181,11 @@ class AgentWorkflowEngine:
         if task_ids is None:
             task_ids = [str(uuid.uuid4()) for _ in tasks]
 
-        task_states = defaultdict(lambda: {"idx": None, "task": None, "episodes": [], "completed": 0, "total_rollouts": rollout_offset, "is_complete": False})
+        task_states = defaultdict(lambda: {"idx": None, "task": None, "episodes": [], "completed": 0, "total_rollouts": 0, "is_complete": False})
 
         futures = []
         idx_counter = 0
+        skipped = 0
         for task, task_id in zip(tasks, task_ids, strict=True):
             state = task_states[task_id]
             if state["idx"] is None:  # First time seeing this task_id
@@ -194,10 +193,16 @@ class AgentWorkflowEngine:
                 state["task"] = task
                 idx_counter += 1
             rollout_idx = state["total_rollouts"]
-            futures.append(self.process_task_with_retry(task, task_id, rollout_idx, **kwargs))
             state["total_rollouts"] += 1
+            if self.output_dir is not None and (self.output_dir / f"{task_id}:{rollout_idx}.json").exists():
+                skipped += 1
+                continue
+            futures.append(self.process_task_with_retry(task, task_id, rollout_idx, **kwargs))
 
-        with tqdm(total=len(tasks), desc="Generating trajectories") as pbar:
+        if skipped:
+            logger.info(f"Skipped {skipped} tasks with existing output files")
+
+        with tqdm(total=len(futures), desc="Generating trajectories") as pbar:
             for future in asyncio.as_completed(futures):
                 task_id, rollout_idx, episode = await future
 
