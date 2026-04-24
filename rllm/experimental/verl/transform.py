@@ -1,3 +1,4 @@
+import logging
 import uuid
 
 import numpy as np
@@ -9,6 +10,8 @@ from rllm.agents.agent import Episode, Trajectory, TrajectoryGroup
 from rllm.experimental.rollout import VerlEngine
 from rllm.experimental.verl.dataclass import AccumulatedData, ProcessedStepData
 from rllm.workflows.workflow import TerminationReason
+
+logger = logging.getLogger(__name__)
 
 
 def _pad_sequence_batch(sequences: list[torch.Tensor], pad_token_id: int, max_length: int, left_pad: bool = True) -> torch.Tensor:
@@ -197,6 +200,31 @@ def _batch_tensors_and_build_data_proto(accumulated: AccumulatedData, pad_token_
         "step_rewards": step_rewards_batch,
     }
 
+    # Include rollout log probs if available (enables importance sampling & bypass mode)
+    if accumulated.rollout_logprobs and len(accumulated.rollout_logprobs) == len(accumulated.responses):
+        rollout_logprobs_batch = _pad_sequence_batch(accumulated.rollout_logprobs, 0, max_response_length, left_pad=False)
+        tensors["rollout_log_probs"] = rollout_logprobs_batch
+
+    # Include routed_experts if available (for Router Replay / R3)
+    # Format: first entry is JSON shape header, rest are per-token base64-encoded int32
+    if accumulated.routing_matrices and len(accumulated.routing_matrices) == len(accumulated.responses):
+        import base64
+        import json as _json
+
+        response_tensors = []
+        for step_rm in accumulated.routing_matrices:
+            shape = _json.loads(step_rm[0])["shape"]  # [num_layers, topk]
+            num_layers, topk = shape
+            token_arrays = [np.frombuffer(base64.b64decode(s), dtype=np.int32).reshape(num_layers, topk) for s in step_rm[1:]]
+            response_tensors.append(torch.from_numpy(np.stack(token_arrays)))  # (completion_len, num_layers, topk)
+
+        # Pad response routing to max_response_length
+        response_routing = _pad_sequence_batch(response_tensors, 0, max_response_length, left_pad=False)
+        # Prepend zeros for prompt positions
+        bs = response_routing.shape[0]
+        prompt_zeros = torch.zeros(bs, max_prompt_length, num_layers, topk, dtype=response_routing.dtype)
+        tensors["routed_experts"] = torch.cat([prompt_zeros, response_routing], dim=1)
+
     return DataProto.from_dict(
         tensors=tensors,
         non_tensors=non_tensors,
@@ -227,17 +255,16 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
     # This corresponds to case when we have `per_step` mode for stepwise advantage computation
     traj_reward = 0.0 if trajectory.reward is None else trajectory.reward
 
+    added_steps = 0
     for step_idx, step in enumerate(trajectory.steps):
+        if step.model_output is None or step.model_output.prompt_ids is None:
+            logger.warning(f"Step {step_idx} in trajectory {trajectory_id} has no valid model_output, skipping")
+            continue
         prompt_ids = torch.tensor(step.model_output.prompt_ids, dtype=torch.long)
         response_ids = torch.tensor(step.model_output.completion_ids, dtype=torch.long)
         mask = torch.ones_like(response_ids, dtype=torch.long)
         step_reward = step.reward
-        # Extract multimodal inputs if available
         multi_modal_inputs = step.model_output.multi_modal_inputs or {}
-        # Construct step_id from trajectory_id and step index
-        # Format: "{trajectory_id}_step{step_idx}"
-        # Example: "abc123_solver_step0", "abc123_judge_step1"
-        # Since trajectory_id doesn't contain rollout info, step_id doesn't either
         step_id = f"{trajectory_id}_step{step_idx}"
 
         step_data = ProcessedStepData(
@@ -248,6 +275,8 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
             step_id=step_id,
             multi_modal_inputs=multi_modal_inputs,
             advantage=step.advantage,
+            logprobs=step.model_output.logprobs,
+            routing_matrices=step.routing_matrices,
         )
 
         accumulated.add_step(
@@ -258,8 +287,9 @@ def _process_trajectory(trajectory: Trajectory, task_id: str, accumulated: Accum
             is_last=step_idx == n_steps - 1,
             group_role=name,
         )
+        added_steps += 1
 
-    return n_steps
+    return added_steps
 
 
 def _process_episode(episode: Episode, task_id: str, accumulated: AccumulatedData) -> int:
@@ -300,16 +330,15 @@ def _process_trajectory_group(trajectory_group: TrajectoryGroup, task_id: str, a
     total_steps = 0
     for trajectory in trajectory_group.trajectories:
         n_steps = _process_trajectory(trajectory, task_id, accumulated)
+        # trajectory.uid is rollout-unique; group_id is shared across rollouts, so using
+        # only group_id would collide advantages across rollouts of the same task.
+        rollout_id = f"{trajectory_group.group_id}:{trajectory.uid}"
+        accumulated.episode_ids.extend([rollout_id] * n_steps)
         total_steps += n_steps
 
-    # Extend episode-level data for all steps in this trajectory group
-    # TrajectoryGroup doesn't have episode-level metadata, so we use reasonable defaults
-    # TODO(listar2000): check whether and how we should supplement these info from trajectory groups.
-    group_id = trajectory_group.group_id if trajectory_group.group_id else task_id
-    accumulated.episode_ids.extend([group_id] * total_steps)
-    accumulated.is_correct.extend([False] * total_steps)  # default to False for trajectory groups
+    accumulated.is_correct.extend([False] * total_steps)
     accumulated.termination_reasons.extend([TerminationReason.UNKNOWN] * total_steps)
-    accumulated.metrics.extend([{}] * total_steps)  # empty metrics for trajectory groups
+    accumulated.metrics.extend([{}] * total_steps)
 
     return total_steps
 
@@ -375,22 +404,28 @@ def update_dataproto_with_advantages(batch: DataProto, container: list[Episode] 
     Updates a DataProto with advantages. Useful when we use rLLM-native advantage computation,
     after which we need to update the DataProto with the advantages.
     """
-    # Build a step_id → advantage mapping from episodes/trajectory groups.
-    # step_id format must match _process_trajectory: f"{task_id}_{trajectory.name}_step{step_idx}"
-    adv_by_step_id: dict[str, float] = {}
+    # Key by (episode_id, step_id): step_id alone collides across rollouts of the same task
+    # (same task_id + trajectory.name + step_idx), so we include the per-rollout-unique
+    # episode_id, which matches batch.non_tensor_batch["episode_ids"].
+    adv_by_key: dict[tuple[str, str], float] = {}
     for item in container:
         for trajectory in item.trajectories:
+            if isinstance(item, Episode):
+                episode_id = item.id
+            else:
+                # Match _process_trajectory_group: rollout-unique id keyed by trajectory.uid
+                episode_id = f"{item.group_id}:{trajectory.uid}"
             trajectory_id = f"{item.task_id}_{trajectory.name}"
             for step_idx, step in enumerate(trajectory.steps):
                 step_id = f"{trajectory_id}_step{step_idx}"
-                adv_by_step_id[step_id] = step.advantage if step.advantage is not None else 0.0
+                adv_by_key[(str(episode_id), step_id)] = step.advantage if step.advantage is not None else 0.0
 
-    # Match advantages to batch entries by step_id (robust to batch reordering and padding)
     n_total = len(batch.non_tensor_batch["trajectory_ids"])
+    episode_ids = batch.non_tensor_batch["episode_ids"]
     step_ids = batch.non_tensor_batch["step_ids"]
     is_pad = batch.non_tensor_batch.get("is_pad_step", np.zeros(n_total, dtype=bool))
 
-    advantages = [0.0 if is_pad[i] else adv_by_step_id.get(str(step_ids[i]), 0.0) for i in range(n_total)]
+    advantages = [0.0 if is_pad[i] else adv_by_key.get((str(episode_ids[i]), str(step_ids[i])), 0.0) for i in range(n_total)]
 
     advantage_tensor = _build_per_step_advantages(batch.batch["response_mask"], advantages)
     batch.batch["advantages"] = advantage_tensor

@@ -21,7 +21,7 @@ def _make_runtime() -> AgentCoreRuntime:
     config = RemoteRuntimeConfig(
         enabled=True,
         backend="agentcore",
-        backend_config={
+        agentcore={
             "agent_runtime_arn": AGENT_ARN,
             "s3_bucket": S3_BUCKET,
         },
@@ -47,7 +47,9 @@ class TestSingleTask:
         """Submit a GSM8K problem, verify success=True, reward is not None."""
         runtime = _make_runtime()
         sub = _make_submission(
-            prompt=("Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?"),
+            prompt=(
+                "Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?"
+            ),
             answer="694",
         )
 
@@ -55,7 +57,7 @@ class TestSingleTask:
 
         assert len(results) == 1
         result = results[0]
-        assert result.success is True
+        assert result.finished is True
         assert result.reward is not None
         assert result.elapsed > 0
         runtime.shutdown()
@@ -94,5 +96,5 @@ class TestTimeoutHandling:
         results = await runtime.execute_tasks([sub], timeout=0.01)
 
         assert len(results) == 1
-        assert results[0].success is False
+        assert results[0].finished is False
         runtime.shutdown()

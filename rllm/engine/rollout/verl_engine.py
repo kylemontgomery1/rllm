@@ -1,18 +1,15 @@
 import uuid
-from typing import cast
 
-from omegaconf import DictConfig
-from typing_extensions import override
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AsyncLLMServerManager
+from verl.workers.rollout.replica import TokenOutput
 
-from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngine, RolloutEngineConfig
-from rllm.engine.rollout.types import TokenInput, Tokenizer, TokenOutput, VerlTokenOutput
+from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngine
 from rllm.parser import ChatTemplateParser
 from rllm.workflows import TerminationEvent, TerminationReason
 
 
 class VerlEngine(RolloutEngine):
-    def __init__(self, config: DictConfig, rollout_manager: AgentLoopManager, tokenizer: Tokenizer, processor=None, **kwargs):
+    def __init__(self, config, rollout_manager, tokenizer, processor=None, **kwargs):
         self.config = config
 
         if config.actor_rollout_ref.rollout.name not in ["vllm", "sglang"]:
@@ -48,38 +45,25 @@ class VerlEngine(RolloutEngine):
         print(f"train_sampling_params: {self.train_sampling_params}")
         print(f"val_sampling_params: {self.val_sampling_params}")
 
-    @property
-    def supports_token_in_token_out(self) -> bool:
-        return True
+        self.validate = False
 
-    @override
-    async def get_token_output_from_token_input(self, token_input: TokenInput, **kwargs) -> VerlTokenOutput:
-        token_input = cast(list[int], token_input)
-
-        input_length = len(token_input)
+    async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
         application_id = kwargs.pop("application_id", str(uuid.uuid4()))
+        validate = self.validate or kwargs.pop("validate", False)
         enforce_max_prompt_length = kwargs.pop("enforce_max_prompt_length", True)
 
-        if enforce_max_prompt_length and input_length > self.max_prompt_length:
-            raise TerminationEvent(TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
+        # these go to the parser
+        tools = kwargs.pop("tools", [])
+        accumulate_reasoning = kwargs.pop("accumulate_reasoning", self.accumulate_reasoning)
 
-        sampling_params = self.val_sampling_params.copy() if self.is_validation else self.train_sampling_params.copy()
+        sampling_params = self.val_sampling_params.copy() if self.validate or validate else self.train_sampling_params.copy()
         sampling_params.update(kwargs)
+
         max_tokens = sampling_params.pop("max_tokens", sampling_params.pop("max_new_tokens", self.max_response_length))
         # starting from verl 0.7.0, we can pass in per-turn max_tokens into the sampling_params
         sampling_params["max_tokens"] = max_tokens
 
-        token_output = await self.server_manager.generate(request_id=application_id, prompt_ids=token_input, sampling_params=sampling_params)
-        return token_output
-
-    @override
-    async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
-        # these go to the parser
-        tools = kwargs.pop("tools", [])
-        accumulate_reasoning = kwargs.pop("accumulate_reasoning", self.accumulate_reasoning)
-        reasoning_effort = kwargs.pop("reasoning_effort", "medium")
-
-        prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning, reasoning_effort=reasoning_effort)
+        prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning)
         request_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)  # list[int]
 
         if any(msg.get("images", None) is not None and msg["role"] == "user" for msg in messages) and self.processor is not None:
@@ -93,50 +77,18 @@ class VerlEngine(RolloutEngine):
             multi_modal_inputs = None
             prompt_ids = request_prompt_ids
 
-        token_output: TokenOutput = await self.get_token_output_from_token_input(token_input=request_prompt_ids, **kwargs)
-        extra_kwargs = dict(prompt_ids=prompt_ids, multi_modal_inputs=multi_modal_inputs)
-        return self.assemble_model_output(token_input=request_prompt_ids, token_output=token_output, **extra_kwargs)
+        prompt_length = len(prompt_ids)
+        if enforce_max_prompt_length and prompt_length > self.max_prompt_length:
+            raise TerminationEvent(TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
 
-    @classmethod
-    def from_config(cls, config: "RolloutEngineConfig") -> "VerlEngine":
-        """Construct a VerlEngine from a RolloutEngineConfig.
+        token_output: TokenOutput = await self.server_manager.generate(request_id=application_id, prompt_ids=request_prompt_ids, image_data=image_data, sampling_params=sampling_params)  # type: ignore
+        completion_ids: list[int] = token_output.token_ids
+        logprobs: list[float] = token_output.log_probs
 
-        Expected ``config.extra`` keys:
-            config: Full training DictConfig.
-            rollout_manager: AgentLoopManager (Ray actor handle).
-        """
-        import ray
-        if not ray.is_initialized():
-            ray.init(address="auto", ignore_reinit_error=True)
+        if token_output.stop_reason in ("aborted", "abort"):
+            raise RuntimeError("Rollout aborted")
 
-        from verl.utils import hf_processor, hf_tokenizer
-
-        tokenizer = hf_tokenizer(config.tokenizer_name, trust_remote_code=True)
-        processor = hf_processor(config.tokenizer_name, trust_remote_code=True, use_fast=True)
-        return cls(
-            config=config.extra["config"],
-            rollout_manager=config.extra["rollout_manager"],
-            tokenizer=tokenizer,
-            processor=processor,
-        )
-
-    @override
-    def assemble_model_output(self, token_input: TokenInput, token_output: TokenOutput, **kwargs) -> ModelOutput:
-        prompt_ids = kwargs.pop("prompt_ids", None)
-        multi_modal_inputs = kwargs.pop("multi_modal_inputs", None)
-        prompt_length = len(prompt_ids) if prompt_ids is not None else 0
-
-        token_output = cast(VerlTokenOutput, token_output)
-        completion_ids = token_output.token_ids
-        logprobs = token_output.log_probs
-
-        # convert the stop reason from verl back to the standard finish reason TODO(listar2000): check backward-compatibility
-        reason_mapping = {"aborted": "abort", "completed": "stop"}
-        if token_output.stop_reason is not None:
-            finish_reason = reason_mapping.get(token_output.stop_reason, token_output.stop_reason)
-        else:
-            finish_reason = "stop"
-
+        finish_reason = "length" if len(completion_ids) >= max_tokens else "stop"
         completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
         # TODO: implement parse_completion for the standard parser
         parsed_output = self.chat_parser.parse_completion(completion_ids)

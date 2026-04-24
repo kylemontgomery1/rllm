@@ -142,6 +142,7 @@ class Step(_StepBase):
             action=action,
             model_response=model_output.content or "",
             model_output=model_output,
+            weight_version=model_output.weight_version,
         )
 
 

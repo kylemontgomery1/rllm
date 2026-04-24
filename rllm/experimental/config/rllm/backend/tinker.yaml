@@ -59,7 +59,10 @@ agent:
 
 # Tinker Engine Configuration
 rollout_engine:
-  strip_thinking_from_history: true
+  reasoning_effort: "medium"
+  accumulate_reasoning: false
+  disable_thinking: false
+  bypass_render_with_parser: false
   renderer_name: null
 
 # Data Configuration
@@ -85,3 +88,6 @@ rllm:
   rollout:
     n: ${oc.select:training.group_size, 8}
     n_val: ${oc.select:validation.group_size, 1}
+  algorithm:
+    rollout_correction:
+      bypass_mode: True

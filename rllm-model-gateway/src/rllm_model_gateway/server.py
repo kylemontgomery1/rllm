@@ -132,6 +132,8 @@ def create_app(
         add_logprobs=config.add_logprobs,
         add_return_token_ids=config.add_return_token_ids,
         sessions=sessions,
+        sampling_params_priority=config.sampling_params_priority,
+        model=config.model,
     )
 
     # -- Health endpoints --------------------------------------------------
@@ -270,21 +272,6 @@ def create_app(
         # Placeholder for hot-reload
         return {"status": "ok"}
 
-    @app.post("/admin/gate/close")
-    async def gate_close():
-        proxy.close_gate()
-        return {"status": "closed"}
-
-    @app.post("/admin/gate/open")
-    async def gate_open():
-        proxy.open_gate()
-        return {"status": "open"}
-
-    @app.post("/admin/gate/drain")
-    async def gate_drain():
-        await proxy.wait_for_drain()
-        return {"status": "drained"}
-
     # -- Proxy catch-all (must be last) ------------------------------------
 
     @app.api_route(
@@ -370,14 +357,15 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         data["log_level"] = args.log_level
     if getattr(args, "store", None) is not None:
         data["store_worker"] = args.store
+    if getattr(args, "sampling_params_priority", None) is not None:
+        data["sampling_params_priority"] = args.sampling_params_priority
+    if getattr(args, "model", None) is not None:
+        data["model"] = args.model
 
     # Workers from CLI --worker flags (WorkerConfig validator auto-splits URLs)
     worker_urls = getattr(args, "worker", None) or []
     if worker_urls:
-        data["workers"] = [
-            {"url": raw_url, "worker_id": str(i)}
-            for i, raw_url in enumerate(worker_urls)
-        ]
+        data["workers"] = [{"url": raw_url, "worker_id": str(i)} for i, raw_url in enumerate(worker_urls)]
 
     return GatewayConfig(**data)
 
@@ -388,9 +376,7 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="rllm-model-gateway: lightweight LLM call proxy for RL training"
-    )
+    parser = argparse.ArgumentParser(description="rllm-model-gateway: lightweight LLM call proxy for RL training")
     parser.add_argument("--host", type=str, default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
@@ -403,6 +389,19 @@ def main() -> None:
     parser.add_argument("--db-path", type=str, default=None)
     parser.add_argument("--store", type=str, default=None, choices=["sqlite", "memory"])
     parser.add_argument("--log-level", type=str, default=None)
+    parser.add_argument(
+        "--sampling-params-priority",
+        type=str,
+        default=None,
+        choices=["client", "session"],
+        help="Conflict resolution for sampling params: 'client' (default) or 'session'.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="If set, the gateway rewrites every request body's 'model' field to this value before forwarding.",
+    )
 
     args = parser.parse_args()
     config = _load_config(args)
@@ -413,9 +412,7 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(
-        app, host=config.host, port=config.port, log_level=config.log_level.lower()
-    )
+    uvicorn.run(app, host=config.host, port=config.port, log_level=config.log_level.lower())
 
 
 if __name__ == "__main__":

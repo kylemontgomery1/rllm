@@ -268,7 +268,7 @@ class FireworksBackend(TinkerBackend):
             policy_job_id=self._policy_job_id,
         )
 
-        from rllm.engine.rollout.rollout_engine import RolloutEngineConfig
+        from rllm.experimental.rollout.rollout_engine import RolloutEngineConfig
 
         cfg = self.full_config
         rollout_extra = dict(cfg.get("rollout_engine", {}))

@@ -3,7 +3,6 @@ import base64
 import logging
 import os
 from io import BytesIO
-import json
 
 import openai
 from PIL import Image
@@ -11,12 +10,27 @@ from PIL import Image
 from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngine
 from rllm.globals import THOUGHT_DELIMITER_END, THOUGHT_DELIMITER_START
 from rllm.parser import ChatTemplateParser
-from rllm.tools.tool_base import Tool, ToolCall, ToolOutput
+from rllm.tools.tool_base import Tool
 from rllm.workflows import TerminationEvent, TerminationReason
 
 
 class OpenAIEngine(RolloutEngine):
-    def __init__(self, model: str = "", tokenizer=None, chat_parser=None, max_prompt_length: int = 4096, max_response_length: int = 4096, max_model_length: int | None = None, api_retries: int = 3, base_url: str = "https://api.openai.com/v1", api_key: str = os.getenv("OPENAI_API_KEY"), sampling_params: dict | None = None, tools: list[Tool | dict] = None, accumulate_reasoning: bool = False, **kwargs):
+    def __init__(
+        self,
+        model: str = "",
+        tokenizer=None,
+        chat_parser=None,
+        max_prompt_length: int = 4096,
+        max_response_length: int = 4096,
+        max_model_length: int | None = None,
+        api_retries: int = 3,
+        base_url: str = "https://api.openai.com/v1",
+        api_key: str = os.getenv("OPENAI_API_KEY"),
+        sampling_params: dict | None = None,
+        tools: list[Tool | dict] = None,
+        accumulate_reasoning: bool = False,
+        **kwargs,
+    ):
         self.model = model
         self.max_prompt_length = max_prompt_length
         self.max_response_length = max_response_length
@@ -36,7 +50,7 @@ class OpenAIEngine(RolloutEngine):
             self._use_chat_completions = False
         else:
             # In this case, we cannot enforce max prompt length or dynamically adjust max_tokens <= max_response_length if needed
-            # print("No tokenizer provided to OpenAIEngine, will use the chat completions endpoint.")
+            print("No tokenizer provided to OpenAIEngine, will use the chat completions endpoint.")
             self._use_chat_completions = True
 
         self.client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
@@ -81,57 +95,6 @@ class OpenAIEngine(RolloutEngine):
 
         return {"max_tokens": max_tokens}
 
-    def _convert_openai_to_tool_calls(self, tool_calls: list[dict] | None) -> list[ToolCall]:
-        """Convert OpenAI tool calls to internal ToolCall objects."""
-        if not tool_calls:
-            return []
-        processed_tool_calls: list[ToolCall] = []
-        for tool_call in tool_calls:
-            try:
-                arguments = json.loads(tool_call.function.arguments)
-            except Exception as e:
-                print(f"Error parsing tool call: {tool_call.function.arguments}, error: {e}")
-                continue
-            processed_tool_calls.append(
-                ToolCall(
-                    id=tool_call.id,
-                    name=tool_call.function.name,
-                    arguments=arguments,
-                )
-            )
-        return processed_tool_calls
-
-    def _convert_tool_calls_to_openai(self, tool_calls: list[ToolCall] | None) -> list[dict] | None:
-        """Convert internal ToolCall objects to OpenAI format using base class method."""
-        if not tool_calls:
-            return None
-        return [tool_call.to_openai_format() if isinstance(tool_call, ToolCall) else tool_call for tool_call in tool_calls]
-
-    def _convert_tool_outputs_to_openai(self, tool_outputs: list[ToolOutput] | None) -> list[dict] | None:
-        """Convert internal ToolOutput objects to OpenAI format using base class method."""
-        if not tool_outputs:
-            return None
-        return [tool_output.to_openai_format() if isinstance(tool_output, ToolOutput) else tool_output for tool_output in tool_outputs]
-
-    def _prepare_messages_for_openai(self, messages: list[dict]) -> list[dict]:
-        """Convert messages from internal format to OpenAI format."""
-        openai_messages = []
-        for msg in messages:
-            role = msg.get("role")
-            if role == "assistant":
-                openai_msg = {"role": "assistant", "content": msg.get("content")}
-                if "tool_calls" in msg and msg["tool_calls"]:
-                    openai_msg["tool_calls"] = self._convert_tool_calls_to_openai(msg["tool_calls"])
-                openai_messages.append(openai_msg)
-            elif role == "tool":
-                assert "tool_outputs" in msg, "Tool message must contain tool_outputs"
-                tool_msgs = self._convert_tool_outputs_to_openai(msg["tool_outputs"])
-                if tool_msgs:
-                    openai_messages.extend(tool_msgs)
-            else:
-                openai_messages.append(msg)
-        return openai_messages
-
     async def chat_completion(self, messages: list[dict], **kwargs) -> ModelOutput:
         kwargs.pop("application_id", None)
         kwargs.pop("validate", None)
@@ -142,22 +105,16 @@ class OpenAIEngine(RolloutEngine):
         sampling_params.update(kwargs)
 
         create_params = self._prepare_max_tokens_param(sampling_params)
-        sampling_params.update(create_params)
-
-        tools = sampling_params.pop("tools", self.tools)
-        if tools:
-            tools = [tool.json if isinstance(tool, Tool) else tool for tool in tools]
-
-        # Convert messages from to OpenAI format
-        openai_messages = self._prepare_messages_for_openai(messages)
+        converted_messages = self._convert_messages_to_openai_format(messages)
 
         retries = self.api_retries
         while retries > 0:
             try:
-                response = await self.client.chat.completions.create(model=self.model, messages=openai_messages, tools=tools, timeout=3600, **sampling_params)
+                response = await self.client.chat.completions.create(model=self.model, messages=converted_messages, timeout=3600, **create_params, **sampling_params)
+
                 content = response.choices[0].message.content
                 reasoning = response.choices[0].message.reasoning if hasattr(response.choices[0].message, "reasoning") and isinstance(response.choices[0].message.reasoning, str) else ""
-                tool_calls = self._convert_openai_to_tool_calls(response.choices[0].message.tool_calls)
+                tool_calls = response.choices[0].message.tool_calls if hasattr(response.choices[0].message, "tool_calls") and isinstance(response.choices[0].message.tool_calls, list) else []
 
                 # Build text with reasoning if available, otherwise use content
                 if reasoning:
@@ -221,7 +178,7 @@ class OpenAIEngine(RolloutEngine):
         retries = self.api_retries
         while retries > 0:
             try:
-                response = await self.client.completions.create(model=self.model, prompt=prompt, timeout=3600, **sampling_params)
+                response = await self.client.completions.create(model=self.model, prompt=prompt, **sampling_params)
                 text = response.choices[0].text
                 try:
                     completion_ids = response.choices[0].token_ids
@@ -300,23 +257,3 @@ class OpenAIEngine(RolloutEngine):
         ids = ids[: self.max_model_length]
         output = await self.completion(ids, max_tokens=1, echo=True, logprobs=1, temperature=1.0, top_p=1.0)
         return output.prompt_logprobs
-
-    @classmethod
-    def from_config(cls, config: "RolloutEngineConfig") -> "OpenAIEngine":
-        from transformers import AutoTokenizer
-        from rllm.engine.rollout.rollout_engine import RolloutEngineConfig
-
-        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
-        sampling_params = (config.sampling_params or {}).get("train", {})
-        return cls(
-            model=config.extra["model"],
-            tokenizer=tokenizer,
-            max_prompt_length=config.max_prompt_length,
-            max_response_length=config.max_response_length,
-            max_model_length=config.max_model_length,
-            base_url=config.extra.get("base_url", "https://api.openai.com/v1"),
-            api_key=config.extra.get("api_key", os.getenv("OPENAI_API_KEY")),
-            sampling_params=sampling_params,
-            accumulate_reasoning=config.accumulate_reasoning,
-            disable_thinking=config.disable_thinking,
-        )

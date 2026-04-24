@@ -16,8 +16,8 @@ from omegaconf import DictConfig
 
 from rllm.agents.agent import Episode
 from rllm.data import Dataset
-from rllm.engine.rollout import RolloutEngine
 from rllm.experimental.common.advantage import AlgorithmConfig, collect_reward_and_advantage_from_trajectory_groups
+from rllm.experimental.rollout import RolloutEngine
 
 if TYPE_CHECKING:
     from rllm.experimental.engine.unified_workflow_engine import UnifiedWorkflowEngine
@@ -37,7 +37,6 @@ class BackendProtocol(ABC, Generic[TDataset, TBatch]):
 
     name: str = "base_backend"
     requires_loop: bool = False
-    needs_weight_sync_gate: bool = True
 
     def __init__(self, config: DictConfig, **kwargs):
         """Initialize the backend.
@@ -206,6 +205,10 @@ class BackendProtocol(ABC, Generic[TDataset, TBatch]):
         """Hook method called at the end of an epoch."""
         pass
 
+    async def on_policy_updated(self, trainer_state: TrainerState) -> None:
+        """Hook called immediately after update_policy() for weight sync."""
+        pass
+
     async def on_validation_start(self, trainer_state: TrainerState) -> bool:
         """Hook method called at the start of validation.
 
@@ -214,15 +217,6 @@ class BackendProtocol(ABC, Generic[TDataset, TBatch]):
         """
         trainer_state.is_training = False
         return True
-
-    async def on_policy_updated(self, trainer_state: TrainerState) -> None:
-        """Hook called immediately after update_policy(). Backends sync weights here.
-
-        For Tinker-like remote/distributed backends: save checkpoint, create new sampling_client.
-        For Verl-like colocated backends: trigger NCCL sync to rollout workers.
-        Default: no-op (sync mode uses on_batch_end for this).
-        """
-        pass
 
     async def on_validation_end(self, trainer_state: TrainerState) -> None:
         """Hook method called at the end of validation."""

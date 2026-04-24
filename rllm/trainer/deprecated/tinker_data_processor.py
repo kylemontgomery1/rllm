@@ -56,6 +56,8 @@ class TinkerAdvantageComputer:
 
             mean_reward = sum(valid_group_rewards) / len(valid_group_rewards)
             std_reward = np.std(valid_group_rewards)
+            if std_reward == 0.0:
+                std_reward = 1.0
             return mean_reward, float(std_reward)
 
         valid_group_rewards = [r for r in group_rewards if r is not None]
@@ -225,7 +227,9 @@ class TinkerDatumBuilder:
         all_mask = [0.0] * ob_len + [1.0] * (len(input_tokens) - ob_len)
 
         # Ensure all lists have the same length
-        assert len(input_tokens) == len(target_tokens) == len(all_logprobs) == len(all_advantages) == len(all_mask), f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(all_logprobs)}, advantages={len(all_advantages)}, mask={len(all_mask)}"
+        assert len(input_tokens) == len(target_tokens) == len(all_logprobs) == len(all_advantages) == len(all_mask), (
+            f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(all_logprobs)}, advantages={len(all_advantages)}, mask={len(all_mask)}"
+        )
 
         # Create Datum
         datum = tinker.types.Datum(
@@ -268,7 +272,9 @@ class TinkerDatumBuilder:
         all_mask = [0.0] * ob_len + [1.0] * (len(input_tokens) - ob_len)
 
         # Ensure all lists have the same length
-        assert len(input_tokens) == len(target_tokens) == len(all_logprobs) == len(all_advantages) == len(all_mask), f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(all_logprobs)}, advantages={len(all_advantages)}, mask={len(all_mask)}"
+        assert len(input_tokens) == len(target_tokens) == len(all_logprobs) == len(all_advantages) == len(all_mask), (
+            f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(all_logprobs)}, advantages={len(all_advantages)}, mask={len(all_mask)}"
+        )
 
         # Create Datum
         datum = tinker.types.Datum(

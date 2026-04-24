@@ -13,8 +13,7 @@ from typing import TYPE_CHECKING, Any
 from tqdm import tqdm
 
 from rllm.agents.agent import Episode
-from rllm.engine.rollout import RolloutEngine
-from rllm.utils import colorful_print
+from rllm.experimental.rollout import RolloutEngine
 from rllm.workflows.store import Store
 from rllm.workflows.workflow import TerminationReason, Workflow
 
@@ -108,6 +107,7 @@ class UnifiedWorkflowEngine:
         assert self.executor is not None, "executor is not initialized"
         if self.workflow_queue is not None:
             return
+        logger.info(f"[WorkflowEngine] Initializing pool with {self.n_parallel_tasks} workflows")
         self.workflow_queue = asyncio.Queue(maxsize=self.n_parallel_tasks)
         for i in range(self.n_parallel_tasks):
             workflow = self.workflow_cls(
@@ -118,6 +118,7 @@ class UnifiedWorkflowEngine:
             )
             assert workflow.is_multithread_safe(), "Workflows must contain only thread-save environments"
             self.workflow_queue.put_nowait(workflow)
+        logger.info(f"[WorkflowEngine] Pool initialized. Queue size: {self.workflow_queue.qsize()}")
 
     async def process_task_with_retry(self, task: dict, task_id: str, rollout_idx: int, result_idx: int, **kwargs) -> tuple[str, int, int, Episode]:
         """Process a single task rollout with retry logic based on termination reasons.
@@ -136,10 +137,12 @@ class UnifiedWorkflowEngine:
             Exception: If task fails permanently after retry_limit attempts and raise_on_error is True.
         """
         assert self.workflow_queue is not None, "workflow_queue is not initialized"
+        logger.debug(f"[WorkflowEngine] Waiting for workflow from queue. Available: {self.workflow_queue.qsize()}")
         workflow = await self.workflow_queue.get()
         try:
             for retry_attempt in range(1, self.retry_limit + 1):
                 uid = f"{task_id}:{rollout_idx}"
+                logger.debug(f"[WorkflowEngine] [{uid}] Starting attempt {retry_attempt}/{self.retry_limit}")
                 workflow.reset(task=task, uid=uid)
                 episode = await workflow.run_with_termination_handling(task=task, uid=uid, **kwargs)
 
@@ -156,24 +159,21 @@ class UnifiedWorkflowEngine:
                     elif len(traj.steps) > 0:
                         reward = f"{traj.steps[-1].reward:.1f}"
                     reward_strs.append(f"{traj.name}: {reward}")
-                colorful_print(
-                    f"[{uid}] Rollout completed. Rewards: [{', '.join(reward_strs)}], Termination: {episode.termination_reason}",
-                    fg="green" if episode.is_correct else "yellow",
-                )
+                logger.debug(f"[{uid}] Rollout completed. Rewards: [{', '.join(reward_strs)}], Termination: {episode.termination_reason}")
 
                 if episode.termination_reason != TerminationReason.ERROR:
                     return task_id, rollout_idx, result_idx, episode
 
                 error_tb = episode.info.get("error", {}).get("traceback")
                 if error_tb:
-                    print(error_tb)
+                    logger.error(f"[WorkflowEngine] [{uid}] Error on attempt {retry_attempt}/{self.retry_limit}:\n{error_tb}")
 
                 if retry_attempt < self.retry_limit:
-                    print(f"[{uid}] Rollout failed on attempt {retry_attempt}/{self.retry_limit}, retrying...")
+                    logger.warning(f"[WorkflowEngine] [{uid}] Rollout failed on attempt {retry_attempt}/{self.retry_limit}, retrying...")
                     continue
 
             if not self.raise_on_error:
-                print(f"[{uid}] Rollout failed permanently after {self.retry_limit} attempts.")
+                logger.error(f"[WorkflowEngine] [{uid}] Rollout failed permanently after {self.retry_limit} attempts.")
             else:
                 raise Exception(f"[{uid}] Rollout failed permanently after {self.retry_limit} attempts.")
 
@@ -181,6 +181,7 @@ class UnifiedWorkflowEngine:
 
         finally:
             await self.workflow_queue.put(workflow)
+            logger.debug(f"[WorkflowEngine] Returned workflow to queue. Available: {self.workflow_queue.qsize()}")
 
     async def execute_tasks(
         self,
@@ -297,20 +298,6 @@ class UnifiedWorkflowEngine:
             for episode, data_source in zip(episodes, data_sources, strict=True):
                 episode.info["data_source"] = data_source
         return episodes
-
-    # --- Gate/sync delegation (matches MultiProcessWorkflowEngine interface) ---
-
-    def close_gate(self):
-        self.rollout_engine.close_gate()
-
-    def open_gate(self):
-        self.rollout_engine.open_gate()
-
-    async def wait_for_drain(self):
-        await self.rollout_engine.wait_for_drain()
-
-    def set_weight_version(self, version: int):
-        self.rollout_engine.weight_version = version
 
     def shutdown(self):
         """Shutdown the workflow engine and cleanup resources."""

@@ -89,13 +89,6 @@ class ReverseProxy:
         self._http: httpx.AsyncClient | None = None
         self._pending_traces: set[asyncio.Task[None]] = set()
 
-        # Gate for weight sync: when closed, new requests wait; in-flight requests finish.
-        self._gate = asyncio.Event()
-        self._gate.set()  # open by default
-        self._active_requests: int = 0
-        self._drained = asyncio.Event()
-        self._drained.set()
-
     async def start(self) -> None:
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout=None),  # no timeout — LLM calls can be long
@@ -114,35 +107,6 @@ class ReverseProxy:
             self._http = None
 
     # ------------------------------------------------------------------
-    # Gate (weight sync)
-    # ------------------------------------------------------------------
-
-    def close_gate(self) -> None:
-        """Block new requests from proceeding. In-flight requests continue."""
-        self._gate.clear()
-
-    def open_gate(self) -> None:
-        """Allow new requests to proceed."""
-        self._gate.set()
-
-    async def wait_for_drain(self) -> None:
-        """Wait until all in-flight requests have completed."""
-        if self._active_requests == 0:
-            return
-        self._drained.clear()
-        await self._drained.wait()
-
-    def _on_request_start(self) -> None:
-        self._active_requests += 1
-        self._drained.clear()
-
-    def _on_request_end(self) -> None:
-        self._active_requests -= 1
-        if self._active_requests <= 0:
-            self._active_requests = 0
-            self._drained.set()
-
-    # ------------------------------------------------------------------
     # Main entrypoint
     # ------------------------------------------------------------------
 
@@ -152,14 +116,6 @@ class ReverseProxy:
 
     async def handle(self, request: Request) -> Response:
         """Proxy *request* to an inference worker, capture trace, return response."""
-        await self._gate.wait()
-        self._on_request_start()
-        try:
-            return await self._handle_inner(request)
-        finally:
-            self._on_request_end()
-
-    async def _handle_inner(self, request: Request) -> Response:
         await self._ensure_started()
         session_id: str | None = request.state.session_id
         originally_requested_logprobs: bool = getattr(request.state, "originally_requested_logprobs", False)
@@ -267,7 +223,44 @@ class ReverseProxy:
             content=raw_body,
             headers=headers,
         )
-        resp = await upstream.__aenter__()
+        # Retry is needed because pooled TCP connections can go stale during the
+        # weight-update idle window: VPC silently drops idle sockets, and the next
+        # request on that socket fails with httpx.ReadError / RemoteProtocolError
+        # ("Server disconnected without sending a response") / ConnectError.
+        # Without retry, these transient failures propagate as failed rollouts and
+        # surface as ASGI exceptions in the agent loop.  The retry uses a fresh
+        # single-use client (no pool) so it cannot hit another stale socket.
+        # retry_client is non-None only when we fell back; event_generator's
+        # finally block closes it after streaming completes.
+        retry_client: httpx.AsyncClient | None = None
+        try:
+            resp = await upstream.__aenter__()
+        except (httpx.ReadError, httpx.ConnectError, httpx.RemoteProtocolError, httpx.TimeoutException) as first_exc:
+            logger.warning(
+                "Connection error to %s (type=%s, msg=%s). Retrying with a fresh connection.",
+                url,
+                type(first_exc).__name__,
+                first_exc,
+            )
+
+            retry_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout=None),
+                limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+                follow_redirects=True,
+            )
+            retry_upstream = retry_client.stream(
+                method=request.method,
+                url=url,
+                content=raw_body,
+                headers=headers,
+            )
+            try:
+                resp = await retry_upstream.__aenter__()
+                upstream = retry_upstream
+            except Exception:
+                await retry_client.aclose()
+                self.router.release(worker.url)
+                raise
 
         t0 = time.perf_counter()
         chunks: list[dict[str, Any]] = []
@@ -303,6 +296,8 @@ class ReverseProxy:
                     yield line + "\n"
             finally:
                 await upstream.__aexit__(None, None, None)
+                if retry_client is not None:
+                    await retry_client.aclose()
                 self.router.release(worker.url)
 
                 latency_ms = (time.perf_counter() - t0) * 1000

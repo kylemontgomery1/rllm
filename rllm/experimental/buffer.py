@@ -12,6 +12,10 @@ import os
 import pickle
 import tempfile
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tqdm import tqdm
 
 from rllm.agents.agent import Episode, TrajectoryGroup
 from rllm.experimental.common import (
@@ -29,13 +33,10 @@ from rllm.workflows.workflow import TerminationReason
 logger = logging.getLogger(__name__)
 
 
-_EPISODE_STRIP_KEYS = {"prompt_ids", "response_ids", "logprobs", "model_output", "routing_matrices"}
-_EPISODE_STRIP_LIST_DEFAULTS = {"prompt_ids", "response_ids", "logprobs"}
-
-
 @dataclass
 class TaskBatch:
     """All trajectory groups produced from one task's episodes, plus stripped episodes for UI logging."""
+
     groups: list[TrajectoryGroup]
     episodes: list[Episode] = field(default_factory=list)
 
@@ -70,6 +71,7 @@ class TrajectoryGroupBuffer:
         rs_config: RejectionSamplingConfig,
         episode_offload_dir: str | None = None,
         trajectory_group_offload_dir: str | None = None,
+        pbar: tqdm | None = None,
     ):
         self._group_size = group_size
         self._coordinator = coordinator
@@ -78,6 +80,7 @@ class TrajectoryGroupBuffer:
         self._transform_config = transform_config
         self._cf_config = cf_config
         self._rs_config = rs_config
+        self._pbar = pbar
 
         # Episode offloading: pending episodes serialized to disk
         self._episode_offload_dir = episode_offload_dir
@@ -146,7 +149,11 @@ class TrajectoryGroupBuffer:
         if len(self._pending[task_id]) < self._group_size:
             return False
 
-        # Group complete — load all episodes
+        # Group complete — tick progress bar
+        if self._pbar is not None:
+            self._pbar.update(1)
+
+        # Load all episodes
         if self._episode_offload_dir:
             episodes = await self._load_pending_episodes(task_id)
         else:
@@ -159,20 +166,16 @@ class TrajectoryGroupBuffer:
 
         # 2. Transform episodes -> trajectory groups
         traj_groups, transform_metrics = transform_episodes_to_trajectory_groups(
-            episodes, self._transform_config, self._cf_config,
+            episodes,
+            self._transform_config,
+            self._cf_config,
         )
-        # Strip heavy fields from episodes for UI logging, free bulk memory
-        for ep in episodes:
-            for traj in ep.trajectories:
-                for step in traj.steps:
-                    for key in _EPISODE_STRIP_KEYS:
-                        setattr(step, key, [] if key in _EPISODE_STRIP_LIST_DEFAULTS else None)
         self._aggregator.record_dict(transform_metrics)
 
         # 3. Drop groups with too few trajectories
         before_min_traj = len(traj_groups)
         traj_groups = [g for g in traj_groups if len(g.trajectories) >= self._rs_config.min_trajs_per_group]
-        self._aggregator.record("buffer/filtered_min_trajs", before_min_traj - len(traj_groups))
+        self._aggregator.record("groups/dropped_min_trajs", before_min_traj - len(traj_groups))
 
         if not traj_groups:
             self._coordinator.on_group_filtered()
@@ -180,7 +183,8 @@ class TrajectoryGroupBuffer:
 
         # 4. Compute advantages
         adv_metrics = collect_reward_and_advantage_from_trajectory_groups(
-            traj_groups, self._algorithm_config,
+            traj_groups,
+            self._algorithm_config,
         )
         self._aggregator.record_dict(adv_metrics)
 
@@ -188,17 +192,9 @@ class TrajectoryGroupBuffer:
         filtered_zero_adv = 0
         if self._rs_config.filter_uniform_groups:
             before_adv = len(traj_groups)
-            traj_groups = [
-                g for g in traj_groups
-                if any(
-                    abs(step.advantage) > 1e-8
-                    for traj in g.trajectories
-                    for step in traj.steps
-                    if step.advantage is not None
-                )
-            ]
+            traj_groups = [g for g in traj_groups if any(abs(step.advantage) > 1e-8 for traj in g.trajectories for step in traj.steps if step.advantage is not None)]
             filtered_zero_adv = before_adv - len(traj_groups)
-        self._aggregator.record("buffer/filtered_zero_adv", filtered_zero_adv)
+        self._aggregator.record("groups/dropped_zero_adv", filtered_zero_adv)
 
         if not traj_groups:
             self._coordinator.on_group_filtered()
@@ -257,21 +253,21 @@ class TrajectoryGroupBuffer:
                 except (TypeError, ValueError):
                     continue
 
-            # Sequence lengths and turn counts from trajectories
-            for traj in ep.trajectories:
-                n_steps = len(traj.steps)
-                prompt_tokens = sum(len(s.prompt_ids) for s in traj.steps)
-                response_tokens = sum(len(s.response_ids) for s in traj.steps)
-                self._aggregator.record("episode/num_turns", n_steps)
-                self._aggregator.record("episode/prompt_tokens", prompt_tokens)
-                self._aggregator.record("episode/response_tokens", response_tokens)
+            # Episode-level totals across all trajectories
+            total_turns = sum(len(traj.steps) for traj in ep.trajectories)
+            total_prompt_tokens = sum(len(s.prompt_ids) for traj in ep.trajectories for s in traj.steps)
+            total_response_tokens = sum(len(s.response_ids) for traj in ep.trajectories for s in traj.steps)
+            self._aggregator.record("episode/num_turns", total_turns)
+            self._aggregator.record("episode/prompt_tokens", total_prompt_tokens)
+            self._aggregator.record("episode/response_tokens", total_response_tokens)
+            self._aggregator.record("episode/correct", 1.0 if ep.is_correct else 0.0)
 
     @staticmethod
     def _min_weight_version(episodes: list[Episode]) -> int:
-        min_v = float('inf')
+        min_v = float("inf")
         for ep in episodes:
             for traj in ep.trajectories:
                 for step in traj.steps:
                     if step.weight_version is not None:
                         min_v = min(min_v, step.weight_version)
-        return int(min_v) if min_v != float('inf') else 0
+        return int(min_v) if min_v != float("inf") else 0

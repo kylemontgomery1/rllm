@@ -35,11 +35,17 @@ class SessionRoutingMiddleware:
         add_logprobs: bool = True,
         add_return_token_ids: bool = True,
         sessions: Any | None = None,
+        sampling_params_priority: str = "client",
+        model: str | None = None,
     ) -> None:
+        if sampling_params_priority not in ("client", "session"):
+            raise ValueError(f"sampling_params_priority must be 'client' or 'session', got {sampling_params_priority!r}")
         self.app = app
         self.add_logprobs = add_logprobs
         self.add_return_token_ids = add_return_token_ids
         self.sessions = sessions  # SessionManager — for per-session sampling params
+        self.sampling_params_priority = sampling_params_priority
+        self.model = model
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -67,17 +73,13 @@ class SessionRoutingMiddleware:
 
         # Inject sampling parameters into POST request bodies (chat completions, etc.)
         method = scope.get("method", "").upper()
-        needs_injection = (
-            self.add_logprobs or self.add_return_token_ids or self.sessions is not None
-        )
+        needs_injection = self.add_logprobs or self.add_return_token_ids or self.sessions is not None
         if method == "POST" and needs_injection:
             await self._inject_params(scope, receive, send, session_id)
         else:
             await self.app(scope, receive, send)
 
-    async def _inject_params(
-        self, scope: Scope, receive: Receive, send: Send, session_id: str | None = None
-    ) -> None:
+    async def _inject_params(self, scope: Scope, receive: Receive, send: Send, session_id: str | None = None) -> None:
         """Read body, inject sampling params, then forward with mutated body."""
         body_parts: list[bytes] = []
         more = True
@@ -94,9 +96,7 @@ class SessionRoutingMiddleware:
                     # Record whether the client originally requested logprobs
                     # so the proxy can strip them from the response if not.
                     state = scope["state"]
-                    state["originally_requested_logprobs"] = (
-                        "logprobs" in payload and payload["logprobs"]
-                    )
+                    state["originally_requested_logprobs"] = "logprobs" in payload and payload["logprobs"]
                     self._mutate(payload, session_id)
                     raw = json.dumps(payload).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -124,18 +124,18 @@ class SessionRoutingMiddleware:
         """Inject ``logprobs``, ``return_token_ids``, and session sampling params."""
         if self.add_logprobs and "logprobs" not in payload:
             payload["logprobs"] = True
-        if self.add_return_token_ids:
-            # extra_body is the OpenAI Python SDK convention for vendor extensions
-            extra = payload.setdefault("extra_body", {})
-            if isinstance(extra, dict) and "return_token_ids" not in extra:
-                extra["return_token_ids"] = True
-            # Also set at root for direct vLLM calls
-            if "return_token_ids" not in payload:
-                payload["return_token_ids"] = True
-        # Inject per-session sampling params (only if client didn't already set them)
+        if self.add_return_token_ids and "return_token_ids" not in payload:
+            payload["return_token_ids"] = True
+        # Pin the model the gateway forwards to (overrides whatever the client sets)
+        if self.model:
+            payload["model"] = self.model
+        # Inject per-session sampling params using the configured priority.
         if session_id and self.sessions is not None:
             sp = self.sessions.get_sampling_params(session_id)
             if sp:
-                for key, value in sp.items():
-                    if key not in payload:
-                        payload[key] = value
+                if self.sampling_params_priority == "session":
+                    payload.update(sp)  # session wins on conflict
+                else:  # "client"
+                    for key, value in sp.items():
+                        if key not in payload:
+                            payload[key] = value

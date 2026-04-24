@@ -23,11 +23,10 @@ from transformers import AutoTokenizer
 
 from rllm.agents.agent import Episode
 from rllm.data import Dataset
-from rllm.engine.rollout import RolloutEngine, TinkerEngine
 from rllm.experimental.common import AlgorithmConfig, simple_timer
 from rllm.experimental.protocol import BackendProtocol
+from rllm.experimental.rollout import RolloutEngine, TinkerEngine
 from rllm.trainer.tinker.tinker_metrics_utils import (
-    print_metrics_table,
     update_training_metrics,
 )
 from rllm.trainer.tinker.tinker_policy_trainer import TinkerPolicyTrainer
@@ -67,7 +66,6 @@ class TinkerBackend(BackendProtocol[Iterable, list[tinker.Datum]]):
 
     name: str = "tinker"
     requires_loop: bool = True  # Tinker uses async operations
-    needs_weight_sync_gate: bool = False  # Tinker swaps sampling_client in-place, no gating needed
 
     def __init__(
         self,
@@ -117,8 +115,6 @@ class TinkerBackend(BackendProtocol[Iterable, list[tinker.Datum]]):
 
         Args:
             **kwargs: Additional arguments, including the various configurations
-                - strip_thinking_from_history: Whether to strip thinking from history (default = true)
-                - renderer_name: Name of the renderer to use (default = auto-detect from model)
 
         Returns:
             TinkerEngine: The initialized rollout engine.
@@ -133,7 +129,7 @@ class TinkerBackend(BackendProtocol[Iterable, list[tinker.Datum]]):
         # we need to get it from `AutoTokenizer` since the `policy_trainer` has not been initialized yet
         self.tokenizer = AutoTokenizer.from_pretrained(self.full_config.model.name)
 
-        from rllm.engine.rollout.rollout_engine import RolloutEngineConfig
+        from rllm.experimental.rollout.rollout_engine import RolloutEngineConfig
 
         cfg = self.full_config
         rollout_extra = dict(cfg.rollout_engine)
@@ -158,7 +154,10 @@ class TinkerBackend(BackendProtocol[Iterable, list[tinker.Datum]]):
         # Check for recommended sampling parameters
         sampling_params = self.full_config.sampling
         if sampling_params.get("temperature", 1.0) != 1.0 or sampling_params.get("top_p", 1.0) != 1.0:
-            logger.warning("Temperature and top_p are set away from 1.0, this is not recommended by Tinker and can cause mysterious issues with logprobs. See https://github.com/thinking-machines-lab/tinker-cookbook/pull/86 for discussion.")
+            logger.warning(
+                "Temperature and top_p are set away from 1.0, this is not recommended by Tinker and can cause mysterious issues with logprobs."
+                "See https://github.com/thinking-machines-lab/tinker-cookbook/pull/86 for discussion."
+            )
 
         # Validate num_minibatches (currently only support 1)
         if self.full_config.training.get("num_minibatches", 1) != 1:
@@ -411,8 +410,8 @@ class TinkerBackend(BackendProtocol[Iterable, list[tinker.Datum]]):
         """Called at the end of training."""
         assert self.policy_trainer is not None, "policy_trainer is not initialized"
 
-        # Save final checkpoint if we didn't just save it in the last batch
-        if trainer_state.global_step % self.full_config.rllm.trainer.save_freq != 0:
+        save_freq = self.full_config.rllm.trainer.save_freq
+        if save_freq <= 0 or trainer_state.global_step % save_freq != 0:
             logger.info(f"Saving final checkpoint at step {trainer_state.global_step}")
             await self.policy_trainer.save_checkpoint_and_get_sampling_client(trainer_state.global_step, kind="both", do_save=True)
 
@@ -447,10 +446,6 @@ class TinkerBackend(BackendProtocol[Iterable, list[tinker.Datum]]):
         # Update metrics
         learning_rate = trainer_state.extra_info.get("scheduled_learning_rate", self.learning_rate)
         update_training_metrics(trainer_state, learning_rate, trainer_state.total_steps)
-
-        # Print metrics table
-        if trainer_state.metrics:
-            print_metrics_table(trainer_state.metrics, trainer_state.global_step)
 
     async def on_epoch_start(self, trainer_state: TrainerState) -> None:
         """Called at the start of an epoch."""

@@ -11,9 +11,9 @@ from tinker.types.tensor_data import TensorData
 from tinker_cookbook.supervised.common import create_rightshifted_model_input_and_leftshifted_targets
 
 from rllm.agents.agent import Trajectory, TrajectoryGroup
-from rllm.engine.rollout.tinker_engine import _flat_token_input_length, _flat_token_input_to_model_input
-from rllm.engine.rollout.types import TinkerTokenInput
 from rllm.experimental.common import AlgorithmConfig, collect_reward_and_advantage_from_trajectory_groups
+from rllm.experimental.rollout.tinker_engine import _flat_token_input_length, _flat_token_input_to_model_input
+from rllm.experimental.rollout.types import TinkerTokenInput
 
 
 def _is_prefix(seq1: TinkerTokenInput, seq2: TinkerTokenInput) -> bool:
@@ -125,10 +125,7 @@ def trajectory_to_datums(traj: Trajectory, router_replay: bool = False) -> list[
         SequenceAccumulator.mask.extend([0.0] * delta_token_input_length + [1.0] * len(output_token_ids))
         if router_replay:
             step_rm = step.routing_matrices or []
-            SequenceAccumulator.routing_matrices.extend(
-                [""] * delta_token_input_length
-                + (list(step_rm) if step_rm else [""] * len(output_token_ids))
-            )
+            SequenceAccumulator.routing_matrices.extend([""] * delta_token_input_length + (list(step_rm) if step_rm else [""] * len(output_token_ids)))
 
     if SequenceAccumulator.full_sequence:
         data.append(make_datum_from_state())
@@ -149,12 +146,7 @@ def transform_trajectory_groups_to_datums(
     Otherwise, we return a list of datums.
     """
     # step 1: compute advantages (skip if already pre-computed by buffer)
-    has_advantages = any(
-        step.advantage is not None
-        for group in trajectory_groups
-        for traj in group.trajectories
-        for step in traj.steps
-    )
+    has_advantages = any(step.advantage is not None for group in trajectory_groups for traj in group.trajectories for step in traj.steps)
     if has_advantages:
         adv_metrics = {}
     else:
@@ -166,12 +158,12 @@ def transform_trajectory_groups_to_datums(
         datums = []
 
     # step 2: iterate over all steps and build the Tinker Datum objects
-    datums_per_traj = []
+    seqs_per_traj = []
     seq_lengths = []
     for group in trajectory_groups:
         for trajectory in group.trajectories:
             traj_datums = trajectory_to_datums(trajectory, router_replay=algorithm_config.router_replay)
-            datums_per_traj.append(len(traj_datums))
+            seqs_per_traj.append(len(traj_datums))
             for d in traj_datums:
                 seq_lengths.append(d.model_input.length)
             if algorithm_config.estimator_map:
@@ -179,13 +171,14 @@ def transform_trajectory_groups_to_datums(
             else:
                 datums.extend(traj_datums)
 
-    if datums_per_traj:
+    if seqs_per_traj:
         import numpy as _np
-        adv_metrics["train/datums_per_traj/mean"] = _np.mean(datums_per_traj)
-        adv_metrics["train/datums_per_traj/min"] = _np.min(datums_per_traj)
-        adv_metrics["train/datums_per_traj/max"] = _np.max(datums_per_traj)
-        adv_metrics["train/seq_length/mean"] = _np.mean(seq_lengths)
-        adv_metrics["train/seq_length/min"] = _np.min(seq_lengths)
-        adv_metrics["train/seq_length/max"] = _np.max(seq_lengths)
+
+        adv_metrics["batch/seqs_per_traj/mean"] = _np.mean(seqs_per_traj)
+        adv_metrics["batch/seqs_per_traj/min"] = _np.min(seqs_per_traj)
+        adv_metrics["batch/seqs_per_traj/max"] = _np.max(seqs_per_traj)
+        adv_metrics["batch/seq_length/mean"] = _np.mean(seq_lengths)
+        adv_metrics["batch/seq_length/min"] = _np.min(seq_lengths)
+        adv_metrics["batch/seq_length/max"] = _np.max(seq_lengths)
 
     return (datums if not algorithm_config.estimator_map else datums_dict), adv_metrics
