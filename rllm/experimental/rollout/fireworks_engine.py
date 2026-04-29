@@ -129,6 +129,7 @@ class FireworksEngine(TinkerEngine):
         self.val_sampling_params = dict((sampling_params or {}).get("val", {}))
 
         # Chat template parser (same setup as TinkerEngine bypass mode)
+        self.bypass_render_with_parser = True
         self.chat_parser = ChatTemplateParser.get_parser(
             tokenizer, processor=processor, disable_thinking=disable_thinking,
         )
