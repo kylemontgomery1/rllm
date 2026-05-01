@@ -160,7 +160,7 @@ class RejectionSamplingConfig:
 
 @dataclass
 class RolloutCorrectionConfig:
-    """Configuration for rollout correction (TIS, proximal forward passes).
+    """Configuration for rollout correction (TIS/IcePop, proximal forward passes).
 
     Backend-agnostic — each backend interprets these according to its infrastructure.
 
@@ -171,6 +171,10 @@ class RolloutCorrectionConfig:
               proximal forward pass. When False, compute π_old via policy.forward()
               (3-policy / decoupled PPO).
         tis_cap: Upper clamp on the TIS importance weight.
+        icepop_mode: None = disabled. "token" or "sequence" = multiply the
+              policy loss by rho inside [1 / icepop_beta, icepop_beta] and
+              zero it outside that band.
+        icepop_beta: Two-sided IcePop mismatch bound.
     """
 
     tis_mode: str | None = None
@@ -178,6 +182,8 @@ class RolloutCorrectionConfig:
     tis_cap: float = 5.0
     rs_mode: str | None = None
     rs_threshold: str | float | None = None
+    icepop_mode: str | None = None
+    icepop_beta: float = 2.0
 
 
 class rLLMAdvantageEstimator(str, Enum):
@@ -232,7 +238,7 @@ class AlgorithmConfig:
     kl_beta: float = 0.0
     eps_clip: float = 0.2
     eps_clip_high: float | None = None
-    loss_agg_mode: Literal["token_mean", "seq_mean_token_sum", "seq_mean_token_mean", None] = None
+    loss_agg_mode: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", None] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
     router_replay: bool = False
 
@@ -246,6 +252,8 @@ class AlgorithmConfig:
             tis_cap=rc_section.get("tis_cap", 2.0),
             rs_mode=rc_section.get("rs_mode", None),
             rs_threshold=rc_section.get("rs_threshold", None),
+            icepop_mode=rc_section.get("icepop_mode", None),
+            icepop_beta=rc_section.get("icepop_beta", 2.0),
         )
         return cls(
             estimator=rLLMAdvantageEstimator(algo.adv_estimator),

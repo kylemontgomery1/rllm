@@ -503,14 +503,25 @@ class UnifiedTrainer:
 
         try:
             gen_task = asyncio.create_task(self._generation_loop(trainer_state, buffer, coordinator))
-            await self._training_loop(trainer_state, buffer, coordinator, aggregator)
-            if not gen_task.done():
-                gen_task.cancel()
-                try:
-                    await gen_task
-                except asyncio.CancelledError:
-                    pass
+            train_task = asyncio.create_task(self._training_loop(trainer_state, buffer, coordinator, aggregator))
+            error_task = asyncio.create_task(coordinator.wait_for_task_error())
+            tasks = {gen_task, train_task, error_task}
+            while tasks:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+                    if task is train_task:
+                        return
         finally:
+            coordinator.cancel_tracked_tasks()
+            for task in (gen_task, train_task, error_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(gen_task, train_task, error_task, return_exceptions=True)
             pbar.close()
 
     async def _generation_loop(
@@ -705,7 +716,9 @@ class UnifiedTrainer:
 
         trainer_state.weight_version = coordinator.weight_version + 1
         await self.backend.on_policy_updated(trainer_state)
-        if rollout_engine is not None:
+        if hasattr(self.agent_workflow_engine, "set_weight_version"):
+            self.agent_workflow_engine.set_weight_version(trainer_state.weight_version)
+        elif rollout_engine is not None:
             rollout_engine.weight_version = trainer_state.weight_version
         coordinator.on_sync_complete()
 

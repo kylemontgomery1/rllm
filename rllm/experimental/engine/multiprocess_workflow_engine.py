@@ -210,9 +210,64 @@ class MultiProcessWorkflowEngine:
         self._result_queue: mp.Queue | None = None
         self._weight_version: mp.Value | None = None
         self._gate_event: mp.Event | None = None
+        self._pending_results: dict[tuple[str, int, int], asyncio.Future] = {}
+        self._result_collector_task: asyncio.Task | None = None
 
         # Single-process fallback
         self._single_engine = None
+
+    @staticmethod
+    def _result_key(task_id: str, rollout_idx: int, result_idx: int) -> tuple[str, int, int]:
+        return task_id, rollout_idx, result_idx
+
+    def _ensure_result_collector(self) -> None:
+        if self._single_engine is not None:
+            return
+        if self._result_queue is None:
+            raise RuntimeError("result queue is not initialized")
+        if self._result_collector_task is None or self._result_collector_task.done():
+            self._result_collector_task = asyncio.create_task(self._collect_results())
+
+    async def _collect_results(self) -> None:
+        """Route worker results from the shared queue to their waiting callers."""
+        assert self._result_queue is not None
+        while True:
+            result = await asyncio.to_thread(self._result_queue.get)
+            if result is None:
+                return
+
+            task_id, rollout_idx, result_idx, _episode = result
+            key = self._result_key(task_id, rollout_idx, result_idx)
+            future = self._pending_results.pop(key, None)
+            if future is None:
+                logger.error("Received multiprocess workflow result with no waiter: %s", key)
+                if not self._pending_results:
+                    return
+                continue
+            if not future.done():
+                future.set_result(result)
+            if not self._pending_results:
+                return
+
+    def _submit_task(
+        self,
+        task: dict,
+        task_id: str,
+        rollout_idx: int,
+        result_idx: int,
+        kwargs: dict,
+        worker_idx: int,
+    ) -> asyncio.Future:
+        self._ensure_result_collector()
+        key = self._result_key(task_id, rollout_idx, result_idx)
+        if key in self._pending_results:
+            raise RuntimeError(f"Duplicate in-flight multiprocess workflow result key: {key}")
+
+        future = asyncio.get_running_loop().create_future()
+        self._pending_results[key] = future
+        future.add_done_callback(lambda f, k=key: self._pending_results.pop(k, None) if f.cancelled() else None)
+        self._task_queues[worker_idx].put((task, task_id, rollout_idx, result_idx, kwargs))
+        return future
 
     async def initialize_pool(self):
         """Initialize workers. Idempotent."""
@@ -334,6 +389,7 @@ class MultiProcessWorkflowEngine:
 
         # Build per-worker assignments
         worker_orig_indices: list[list[int]] = [[] for _ in range(self.n_workers)]
+        futures: list[asyncio.Future] = []
         total_dispatched = 0
 
         skipped = 0
@@ -345,7 +401,7 @@ class MultiProcessWorkflowEngine:
                     skipped += 1
                     rollout_counter += 1
                     continue
-                self._task_queues[w].put((task, task_id, rollout_counter, orig_idx, kwargs))
+                futures.append(self._submit_task(task, task_id, rollout_counter, orig_idx, kwargs, w))
                 worker_orig_indices[w].append(orig_idx)
                 rollout_counter += 1
                 total_dispatched += 1
@@ -358,9 +414,8 @@ class MultiProcessWorkflowEngine:
         collected = 0
 
         with tqdm(total=total_dispatched, desc="Generating trajectories") as pbar:
-            while collected < total_dispatched:
-                # Read from result queue in a thread to avoid blocking the event loop
-                result = await asyncio.to_thread(self._result_queue.get)
+            for future in asyncio.as_completed(futures):
+                result = await future
                 task_id, rollout_idx, result_idx, episode = result
 
                 if self.output_dir is not None:
@@ -413,9 +468,8 @@ class MultiProcessWorkflowEngine:
             )
 
         worker_idx = hash(task_id) % self.n_workers
-        self._task_queues[worker_idx].put((task, task_id, rollout_idx, result_idx, kwargs))
-        result = await asyncio.to_thread(self._result_queue.get)
-        return result
+        future = self._submit_task(task, task_id, rollout_idx, result_idx, kwargs, worker_idx)
+        return await future
 
     # ------------------------------------------------------------------
     # Training step / metadata
@@ -476,6 +530,15 @@ class MultiProcessWorkflowEngine:
         if self._single_engine is not None:
             self._single_engine.shutdown()
         else:
+            if self._result_queue is not None:
+                self._result_queue.put(None)
+            if self._result_collector_task is not None:
+                self._result_collector_task.cancel()
+                self._result_collector_task = None
+            for future in self._pending_results.values():
+                if not future.done():
+                    future.cancel()
+            self._pending_results.clear()
             for q in self._task_queues:
                 q.put(None)
             for p in self._processes:

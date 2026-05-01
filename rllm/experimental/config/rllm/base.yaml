@@ -82,6 +82,8 @@ algorithm:
     tis_cap: 2.0          # Upper clamp on TIS importance weight
     rs_mode: null         # null = disabled; token_k{1,2,3} / seq_sum_k{1,2,3} / seq_mean_k{1,2,3} / seq_max_k{2,3}, comma-chained
     rs_threshold: null    # "lower_upper" for k1 (e.g. "0.1_1.2"); upper bound for k2/k3
+    icepop_mode: null     # null = disabled, "token" or "sequence" = hard two-sided IcePop pop(rho, 1/beta, beta)
+    icepop_beta: 2.0      # IcePop keeps rho inside [1/beta, beta], zeros it outside
 
 # Stepwise advantage
 # TODO(listar2000): deprecate the `per_step` mode and refactor this config.

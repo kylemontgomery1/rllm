@@ -210,6 +210,137 @@ class FireworksPolicyTrainer:
         )
         return [out["logprobs"].data for out in prox_fwd.loss_fn_outputs]
 
+    @staticmethod
+    def _compute_icepop_weight(resp_prox, resp_inf, mode: str, beta: float):
+        """Compute IcePop's hard two-sided mismatch weight."""
+        import torch
+
+        if mode not in ("token", "sequence"):
+            raise ValueError(f"icepop_mode must be null, 'token', or 'sequence', got {mode!r}")
+        if beta <= 1.0:
+            raise ValueError(f"icepop_beta must be > 1.0, got {beta}")
+
+        log_ratio = torch.clamp(resp_prox - resp_inf, min=-20.0, max=20.0)
+        if mode == "sequence":
+            rho = torch.exp(log_ratio.mean()).expand_as(log_ratio)
+        else:
+            rho = torch.exp(log_ratio)
+
+        lower = 1.0 / beta
+        keep = (rho >= lower) & (rho <= beta)
+        return torch.where(keep, rho, torch.zeros_like(rho)), rho, keep
+
+    @classmethod
+    def _build_icepop_builtin_loss_datums(
+        cls,
+        data: list[tinker.Datum],
+        advantages: list[float],
+        prox_logprobs: list[list[float]],
+        inf_logprobs: list[list[float]],
+        prompt_lens: list[int],
+        icepop_mode: str,
+        icepop_beta: float,
+        policy_loss: str = "rl_loss",
+    ) -> tuple[list[tinker.Datum], dict[str, float]]:
+        """Build server-side loss datums with IcePop folded into advantages."""
+        import torch
+        from training.utils.rl.common import _get_loss_mask, validate_inference_logprobs_for_sample
+
+        result: list[tinker.Datum] = []
+        adv_idx = 0
+        metric_weights: list[torch.Tensor] = []
+        metric_rhos: list[torch.Tensor] = []
+        metric_keeps: list[torch.Tensor] = []
+
+        for i, datum in enumerate(data):
+            target_data = datum.loss_fn_inputs["target_tokens"]
+            target_tokens = list(target_data.data)
+            n_tokens = len(target_tokens)
+            response_start = max(0, prompt_lens[i] - 1)
+            prox_lp = list(prox_logprobs[i])
+            inf_lp = list(inf_logprobs[i]) if i < len(inf_logprobs) else []
+
+            resp_len = max(0, n_tokens - response_start)
+            loss_mask = _get_loss_mask(
+                datum,
+                response_start,
+                resp_len,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            )
+            active_count = int((loss_mask > 0.5).sum().item())
+
+            if resp_len > 0 and active_count > 0:
+                validate_inference_logprobs_for_sample(policy_loss, i, inf_lp, response_start + resp_len)
+                resp_prox = torch.tensor(prox_lp[response_start:response_start + resp_len], dtype=torch.float32)
+                resp_inf = torch.tensor(inf_lp[response_start:response_start + resp_len], dtype=torch.float32)
+                icepop_weight, rho, keep = cls._compute_icepop_weight(
+                    resp_prox,
+                    resp_inf,
+                    icepop_mode,
+                    icepop_beta,
+                )
+
+                active = loss_mask > 0.5
+                metric_weights.append(icepop_weight[active])
+                metric_rhos.append(rho[active])
+                metric_keeps.append(keep[active])
+            else:
+                icepop_weight = torch.ones(resp_len, dtype=torch.float32)
+
+            per_token_adv = [0.0] * response_start
+            adv_val = advantages[adv_idx] if adv_idx < len(advantages) else 0.0
+            for r in range(resp_len):
+                per_token_adv.append(float(adv_val * icepop_weight[r].item() * loss_mask[r].item()))
+
+            if len(prox_lp) >= n_tokens:
+                slp_padded = prox_lp[:n_tokens]
+            else:
+                slp_padded = prox_lp + [0.0] * (n_tokens - len(prox_lp))
+
+            result.append(
+                tinker.Datum(
+                    model_input=datum.model_input,
+                    loss_fn_inputs={
+                        "target_tokens": tinker.TensorData(
+                            data=target_tokens,
+                            dtype="int64",
+                            shape=[n_tokens],
+                        ),
+                        "logprobs": tinker.TensorData(
+                            data=slp_padded,
+                            dtype="float32",
+                            shape=[n_tokens],
+                        ),
+                        "advantages": tinker.TensorData(
+                            data=per_token_adv,
+                            dtype="float32",
+                            shape=[n_tokens],
+                        ),
+                    },
+                )
+            )
+            adv_idx += 1
+
+        metrics: dict[str, float] = {}
+        if metric_weights:
+            weights = torch.cat(metric_weights)
+            rhos = torch.cat(metric_rhos)
+            keeps = torch.cat(metric_keeps)
+            metrics.update(
+                {
+                    "icepop/weight_mean": weights.mean().item(),
+                    "icepop/rho_mean": rhos.mean().item(),
+                    "icepop/zero_frac": (~keeps).float().mean().item(),
+                    "icepop/low_frac": (rhos < (1.0 / icepop_beta)).float().mean().item(),
+                    "icepop/high_frac": (rhos > icepop_beta).float().mean().item(),
+                }
+            )
+            if icepop_mode == "sequence":
+                metrics["icepop/seq_ratio_mean"] = rhos.mean().item()
+
+        return result, metrics
+
     def resolve_builtin_loss(self, algorithm_config: AlgorithmConfig, profile=None):
         """Resolve the builtin server-side loss kernel at setup time.
 
@@ -287,10 +418,10 @@ class FireworksPolicyTrainer:
         rc = algorithm_config.rollout_correction
         clean_datums, advantages, inf_logprobs, prompt_lens, num_loss_tokens = self._process_datums(raw_datums)
 
-        # seq_mean_token_mean: normalize advantages by number of loss tokens so that
+        # seq-mean-token-mean: normalize advantages by number of loss tokens so that
         # token-sum within each sequence equals token-mean, then NUM_SEQUENCES
         # at optim_step gives seq-mean-token-mean overall.
-        if algorithm_config.loss_agg_mode == "seq_mean_token_mean":
+        if algorithm_config.loss_agg_mode == "seq-mean-token-mean":
             for i in range(len(advantages)):
                 advantages[i] /= max(1, num_loss_tokens[i])
 
@@ -300,13 +431,26 @@ class FireworksPolicyTrainer:
         else:
             prox_logprobs = await self._compute_proximal_logprobs(clean_datums)
 
-        # Build datums for the builtin kernel
-        tis_config = TISConfig(level=rc.tis_mode or "token", cap=rc.tis_cap) if rc.tis_mode else None
-        builtin_datums = build_builtin_loss_datums(
-            clean_datums, advantages, prox_logprobs, inf_logprobs, prompt_lens,
-            tis_config=tis_config,
-            policy_loss=algorithm_config.loss_fn or "grpo",
-        )
+        # Build datums for the builtin kernel.
+        if rc.icepop_mode:
+            builtin_datums, icepop_metrics = self._build_icepop_builtin_loss_datums(
+                clean_datums,
+                advantages,
+                prox_logprobs,
+                inf_logprobs,
+                prompt_lens,
+                icepop_mode=rc.icepop_mode,
+                icepop_beta=rc.icepop_beta,
+                policy_loss=algorithm_config.loss_fn or "grpo",
+            )
+            adv_metrics.update(icepop_metrics)
+        else:
+            tis_config = TISConfig(level=rc.tis_mode or "token", cap=rc.tis_cap) if rc.tis_mode else None
+            builtin_datums = build_builtin_loss_datums(
+                clean_datums, advantages, prox_logprobs, inf_logprobs, prompt_lens,
+                tis_config=tis_config,
+                policy_loss=algorithm_config.loss_fn or "grpo",
+            )
 
         kernel_loss, kernel_config = self._builtin_loss
         fwd_bwd_result = await asyncio.to_thread(
@@ -361,9 +505,9 @@ class FireworksPolicyTrainer:
         )
         from fireworks.training.sdk.client import GradAccNormalization
         _LOSS_AGG_MAP = {
-            "token_mean": GradAccNormalization.NUM_LOSS_TOKENS,
-            "seq_mean_token_sum": GradAccNormalization.NUM_SEQUENCES,
-            "seq_mean_token_mean": GradAccNormalization.NUM_SEQUENCES,
+            "token-mean": GradAccNormalization.NUM_LOSS_TOKENS,
+            "seq-mean-token-sum": GradAccNormalization.NUM_SEQUENCES,
+            "seq-mean-token-mean": GradAccNormalization.NUM_SEQUENCES,
         }
         grad_norm = _LOSS_AGG_MAP.get(self.algorithm_config.loss_agg_mode)
         optim_result = await asyncio.to_thread(
@@ -417,4 +561,3 @@ class FireworksPolicyTrainer:
         except Exception:
             logger.exception("Failed to save DCP checkpoint %s", name)
             raise
-

@@ -312,9 +312,12 @@ class FireworksBackend(TinkerBackend):
         # Loss function validation is handled by resolve_builtin_loss() at setup time.
         alg = self.full_config.rllm.algorithm
         loss_fn = alg.get("loss_fn", None)
+        loss_agg_mode = alg.get("loss_agg_mode", None)
         eps_clip_high = alg.get("eps_clip_high", None)
         rc = alg.get("rollout_correction", {})
         tis_mode = rc.get("tis_mode", None)
+        icepop_mode = rc.get("icepop_mode", None)
+        icepop_beta = rc.get("icepop_beta", 2.0)
         bypass_mode = rc.get("bypass_mode", True)
 
         # eps_clip_high only meaningful for dapo/cispo (asymmetric clipping)
@@ -325,11 +328,28 @@ class FireworksBackend(TinkerBackend):
                 loss_fn,
             )
 
+        valid_loss_agg_modes = {None, "token-mean", "seq-mean-token-sum", "seq-mean-token-mean"}
+        if loss_agg_mode not in valid_loss_agg_modes:
+            raise ValueError(
+                "rllm.algorithm.loss_agg_mode must be null, 'token-mean', "
+                "'seq-mean-token-sum', or 'seq-mean-token-mean' for the Fireworks backend, "
+                f"got {loss_agg_mode!r}"
+            )
+        logger.info("Fireworks loss aggregation mode: %s", loss_agg_mode or "backend default")
+
         # rollout_correction.tis_mode validation
         if tis_mode is not None and tis_mode not in ("token", "sequence"):
             raise ValueError(
                 f"rollout_correction.tis_mode must be null, 'token', or 'sequence', got '{tis_mode}'"
             )
+        if icepop_mode is not None and icepop_mode not in ("token", "sequence"):
+            raise ValueError(
+                f"rollout_correction.icepop_mode must be null, 'token', or 'sequence', got '{icepop_mode}'"
+            )
+        if icepop_beta <= 1.0:
+            raise ValueError(f"rollout_correction.icepop_beta must be > 1.0, got {icepop_beta}")
+        if tis_mode is not None and icepop_mode is not None:
+            raise ValueError("Set only one of rollout_correction.tis_mode or rollout_correction.icepop_mode")
 
         # TIS with bypass is a no-op (prox = inf → weight = 1.0)
         if tis_mode is not None and bypass_mode:
@@ -337,6 +357,12 @@ class FireworksBackend(TinkerBackend):
                 "rollout_correction.tis_mode='%s' with bypass_mode=true — TIS weight "
                 "will be 1.0 (no correction). Set bypass_mode=false for active TIS.",
                 tis_mode,
+            )
+        if icepop_mode is not None and bypass_mode:
+            logger.warning(
+                "rollout_correction.icepop_mode='%s' with bypass_mode=true — IcePop weight "
+                "will be 1.0 unless numerical noise is present. Set bypass_mode=false for active IcePop.",
+                icepop_mode,
             )
 
         # save_freq must be a multiple of sync interval (save requires a sampler snapshot from sync)

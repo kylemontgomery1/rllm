@@ -93,6 +93,7 @@ class TrajectoryGroupBuffer:
         if trajectory_group_offload_dir:
             os.makedirs(trajectory_group_offload_dir, exist_ok=True)
         self._queue: asyncio.Queue[TaskBatch | str | None] = asyncio.Queue()
+        self._generation_complete = False
 
     async def _offload_episode(self, task_id: str, episode: Episode) -> str:
         """Serialize episode to disk, return file path."""
@@ -139,6 +140,10 @@ class TrajectoryGroupBuffer:
 
     async def add_episode(self, task_id: str, episode: Episode) -> bool:
         """Add episode. When group completes, process and queue task batch."""
+        if self._generation_complete:
+            logger.warning("Ignoring episode for task %s after generation was marked complete", task_id)
+            return False
+
         # Offload episode to disk if enabled
         if self._episode_offload_dir:
             path = await self._offload_episode(task_id, episode)
@@ -221,6 +226,9 @@ class TrajectoryGroupBuffer:
 
     def mark_generation_complete(self) -> None:
         """Signal that generation is finished. Flushes incomplete groups and enqueues a sentinel."""
+        if self._generation_complete:
+            return
+        self._generation_complete = True
         for task_id in list(self._pending.keys()):
             items = self._pending.pop(task_id, [])
             for item in items:
