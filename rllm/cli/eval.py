@@ -150,9 +150,15 @@ def _run_eval(
 
         # Apply CLI sandbox overrides
         if agent_metadata:
+            from rllm.integrations.harbor.runtime import HarborRuntime
             from rllm.sandbox.sandboxed_flow import SandboxedAgentFlow
 
-            if isinstance(agent, SandboxedAgentFlow):
+            if isinstance(agent, HarborRuntime):
+                if "sandbox_backend" in agent_metadata:
+                    agent.environment_type = agent_metadata["sandbox_backend"]
+                if "sandbox_concurrency" in agent_metadata:
+                    agent.max_concurrent = agent_metadata["sandbox_concurrency"]
+            elif isinstance(agent, SandboxedAgentFlow):
                 if "sandbox_backend" in agent_metadata:
                     agent.sandbox_backend = agent_metadata["sandbox_backend"]
                 if "sandbox_concurrency" in agent_metadata:
@@ -219,8 +225,10 @@ def _run_eval(
             else:
                 split = "test"
 
-        # Docker check for Harbor tasks
-        if (agent_name and agent_name.startswith("harbor:")) or (catalog_entry and catalog_entry.get("source", "").startswith("harbor:")):
+        # Docker check for Harbor tasks — only when actually using the docker backend.
+        _is_harbor = (agent_name and agent_name.startswith("harbor:")) or (catalog_entry and catalog_entry.get("source", "").startswith("harbor:"))
+        _effective_sandbox = ((agent_metadata or {}).get("sandbox_backend") or "docker").lower()
+        if _is_harbor and _effective_sandbox == "docker":
             from rllm.integrations.harbor.utils import diagnose_docker
 
             ok, reason, hint = diagnose_docker()
@@ -249,6 +257,8 @@ def _run_eval(
             if isinstance(agent, HarborRuntime):
                 if "sandbox_backend" in agent_metadata:
                     agent.environment_type = agent_metadata["sandbox_backend"]
+                if "sandbox_concurrency" in agent_metadata:
+                    agent.max_concurrent = agent_metadata["sandbox_concurrency"]
             elif isinstance(agent, SandboxedAgentFlow):
                 if "sandbox_backend" in agent_metadata:
                     agent.sandbox_backend = agent_metadata["sandbox_backend"]

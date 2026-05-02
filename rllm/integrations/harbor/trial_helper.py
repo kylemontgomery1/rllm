@@ -177,9 +177,14 @@ def build_harbor_trial_config(
 
         env_type = EnvironmentType(environment_type)
 
+    trial_config_kwargs = {}
+    if "HARBOR_TRIALS_DIR" in os.environ:
+        trial_config_kwargs["trials_dir"] = Path(os.environ["HARBOR_TRIALS_DIR"])
+
     return TrialConfig(
         task=TaskConfig(path=Path(task_path)),
         trial_name=trial_name,
+        **trial_config_kwargs,
         agent_timeout_multiplier=agent_timeout_multiplier,
         verifier_timeout_multiplier=verifier_timeout_multiplier,
         agent_setup_timeout_multiplier=agent_setup_timeout_multiplier,
