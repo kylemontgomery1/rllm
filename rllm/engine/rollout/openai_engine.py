@@ -50,7 +50,7 @@ class OpenAIEngine(RolloutEngine):
             self._use_chat_completions = False
         else:
             # In this case, we cannot enforce max prompt length or dynamically adjust max_tokens <= max_response_length if needed
-            print("No tokenizer provided to OpenAIEngine, will use the chat completions endpoint.")
+            logging.getLogger(__name__).debug("No tokenizer provided to OpenAIEngine, will use the chat completions endpoint.")
             self._use_chat_completions = True
 
         self.client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)

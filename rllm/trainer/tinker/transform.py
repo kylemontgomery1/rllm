@@ -3,6 +3,7 @@ Transformation utilities for converting token input (TinkerTokenInput) to Tinker
 Code is adapted from https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/rl/data_processing.py
 """
 
+import logging
 from collections import defaultdict
 from typing import cast
 
@@ -14,6 +15,8 @@ from rllm.agents.agent import Trajectory, TrajectoryGroup
 from rllm.experimental.common import AlgorithmConfig, collect_reward_and_advantage_from_trajectory_groups
 from rllm.experimental.rollout.tinker_engine import _flat_token_input_length, _flat_token_input_to_model_input
 from rllm.experimental.rollout.types import TinkerTokenInput
+
+logger = logging.getLogger(__name__)
 
 
 def _is_prefix(seq1: TinkerTokenInput, seq2: TinkerTokenInput) -> bool:
@@ -160,9 +163,20 @@ def transform_trajectory_groups_to_datums(
     # step 2: iterate over all steps and build the Tinker Datum objects
     seqs_per_traj = []
     seq_lengths = []
+    dropped_malformed_sequences = 0
     for group in trajectory_groups:
-        for trajectory in group.trajectories:
-            traj_datums = trajectory_to_datums(trajectory, router_replay=algorithm_config.router_replay)
+        for traj_idx, trajectory in enumerate(group.trajectories):
+            try:
+                traj_datums = trajectory_to_datums(trajectory, router_replay=algorithm_config.router_replay)
+            except AssertionError as e:
+                dropped_malformed_sequences += 1
+                logger.warning(
+                    "Dropping malformed training trajectory group_id=%s traj_idx=%d: %s",
+                    group.group_id,
+                    traj_idx,
+                    e,
+                )
+                continue
             seqs_per_traj.append(len(traj_datums))
             for d in traj_datums:
                 seq_lengths.append(d.model_input.length)
@@ -170,6 +184,8 @@ def transform_trajectory_groups_to_datums(
                 datums_dict[group.group_role].extend(traj_datums)
             else:
                 datums.extend(traj_datums)
+
+    adv_metrics["batch/dropped_malformed_sequences"] = dropped_malformed_sequences
 
     if seqs_per_traj:
         import numpy as _np

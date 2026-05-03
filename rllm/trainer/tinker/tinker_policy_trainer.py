@@ -244,6 +244,16 @@ class TinkerPolicyTrainer:
             trajectory_groups,
             algorithm_config=algorithm_config,
         )
+        flat_training_datums = (
+            [datum for datums in training_datums.values() for datum in datums]
+            if isinstance(training_datums, dict)
+            else training_datums
+        )
+        adv_metrics["train/num_sequences"] = len(flat_training_datums)
+        adv_metrics["train/active_tokens"] = sum(
+            int(sum(datum.loss_fn_inputs["mask"].data))
+            for datum in flat_training_datums
+        )
 
         # Forward-backward pass
         fwd_bwd_futures = await self._get_forward_backward_futures(
@@ -315,6 +325,16 @@ class TinkerPolicyTrainer:
         training_datums, adv_metrics = transform_trajectory_groups_to_datums(
             trajectory_groups,
             algorithm_config=self.algorithm_config,
+        )
+        flat_training_datums = (
+            [datum for datums in training_datums.values() for datum in datums]
+            if isinstance(training_datums, dict)
+            else training_datums
+        )
+        adv_metrics["train/num_sequences"] = len(flat_training_datums)
+        adv_metrics["train/active_tokens"] = sum(
+            int(sum(datum.loss_fn_inputs["mask"].data))
+            for datum in flat_training_datums
         )
 
         # Forward-backward and optimizer future together

@@ -43,6 +43,10 @@ _MAX_SAMPLE_ATTEMPTS = 5
 _TRANSIENT_ERROR_CODES = ("502", "503", "425", "Connection", "incomplete chunked read")
 
 
+class _EmptyCompletionIdsError(RuntimeError):
+    pass
+
+
 class _SampledSequenceAdapter:
     """Lightweight adapter so that a ``DeploymentSampler.completions`` response
     exposes the same ``.tokens``, ``.logprobs``, ``.stop_reason`` interface
@@ -167,6 +171,8 @@ class FireworksEngine(TinkerEngine):
         sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
         result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
         result.weight_version = version
+        result.routing_matrices = sampled_sequence.routing_matrices
+        result.metrics = sampled_sequence.server_metrics
         return result
 
     @override
@@ -179,6 +185,8 @@ class FireworksEngine(TinkerEngine):
         sampled_sequence = await self.get_token_output_from_token_input(token_input=token_input, **kwargs)
         result = self.assemble_model_output(token_input=token_input, token_output=sampled_sequence)
         result.weight_version = version
+        result.routing_matrices = sampled_sequence.routing_matrices
+        result.metrics = sampled_sequence.server_metrics
         return result
 
     @property
@@ -203,7 +211,9 @@ class FireworksEngine(TinkerEngine):
         input_length = _flat_token_input_length(token_input)
 
         enforce_max_prompt_length = kwargs.pop("enforce_max_prompt_length", True)
-        if enforce_max_prompt_length and input_length > min(self.max_prompt_length, self.max_model_length):
+        if enforce_max_prompt_length and (
+            input_length > self.max_prompt_length or input_length >= self.max_model_length
+        ):
             raise TerminationEvent(TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
 
         # Flatten TinkerTokenInput to plain list[int]
@@ -255,14 +265,14 @@ class FireworksEngine(TinkerEngine):
                 logger.debug("router_replay enabled but API returned no routing matrices")
 
         if logprobs is not None and len(logprobs) != len(completion_ids):
-            logger.warning(
-                "Length mismatch: %d logprobs vs %d completion tokens",
-                len(logprobs), len(completion_ids),
+            raise RuntimeError(
+                f"Fireworks response length mismatch: {len(logprobs)} logprobs vs "
+                f"{len(completion_ids)} completion tokens"
             )
         if routing_matrices is not None and len(routing_matrices) != len(completion_ids):
-            logger.warning(
-                "Length mismatch: %d routing matrices vs %d completion tokens",
-                len(routing_matrices), len(completion_ids),
+            raise RuntimeError(
+                f"Fireworks response length mismatch: {len(routing_matrices)} routing matrices vs "
+                f"{len(completion_ids)} completion tokens"
             )
 
         return _SampledSequenceAdapter(  # type: ignore[return-value]
@@ -301,13 +311,19 @@ class FireworksEngine(TinkerEngine):
                     k: v for k, v in dataclasses.asdict(server_metrics).items()
                     if v is not None
                 } if server_metrics else None
+                choice = (result.get("choices") or [{}])[0]
+                completion_ids = (choice.get("raw_output") or {}).get("completion_token_ids") or []
+                if not completion_ids:
+                    raise _EmptyCompletionIdsError("Fireworks response included empty completion_token_ids")
                 return result, metrics_dict
             except Exception as exc:
                 err = str(exc)
-                transient = any(code in err for code in _TRANSIENT_ERROR_CODES)
+                transient = isinstance(exc, _EmptyCompletionIdsError) or any(
+                    code in err for code in _TRANSIENT_ERROR_CODES
+                )
                 if transient and attempt < _MAX_SAMPLE_ATTEMPTS - 1:
                     wait = 10 * (attempt + 1)
-                    logger.warning(
+                    logger.debug(
                         "Attempt %d/%d failed (%s), retrying in %ds…",
                         attempt + 1, _MAX_SAMPLE_ATTEMPTS, exc, wait,
                     )

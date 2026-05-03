@@ -13,11 +13,13 @@ import pytest
 import tinker
 from tinker.types import ImageChunk
 
-from rllm.agents.agent import Step, Trajectory
+from rllm.agents.agent import Step, Trajectory, TrajectoryGroup
+from rllm.experimental.common import AlgorithmConfig
 from rllm.trainer.tinker.transform import (
     _flatten_token_input,
     _is_prefix,
     trajectory_to_datums,
+    transform_trajectory_groups_to_datums,
 )
 
 # =============================================================================
@@ -530,6 +532,40 @@ class TestTrajectoryToDataEdgeCases:
 
         with pytest.raises(AssertionError, match="advantage is None"):
             trajectory_to_datums(trajectory)
+
+    def test_batch_transform_drops_malformed_trajectory(self):
+        """Batch transform should skip malformed trajectories instead of crashing."""
+        valid = Trajectory(
+            steps=[
+                Step(
+                    prompt_ids=[1, 2, 3],
+                    response_ids=[4, 5],
+                    logprobs=[-0.1, -0.2],
+                    advantage=1.0,
+                )
+            ],
+            reward=1.0,
+        )
+        malformed = Trajectory(
+            steps=[
+                Step(
+                    prompt_ids=[1, 2, 3],
+                    response_ids=[4, 5],
+                    logprobs=[],
+                    advantage=1.0,
+                )
+            ],
+            reward=0.0,
+        )
+        group = TrajectoryGroup(trajectories=[valid, malformed], group_id="task:default")
+
+        datums, metrics = transform_trajectory_groups_to_datums(
+            [group],
+            AlgorithmConfig(),
+        )
+
+        assert len(datums) == 1
+        assert metrics["batch/dropped_malformed_sequences"] == 1
 
     def test_single_token_prompt_and_response(self):
         """Test minimal case with single token prompt and response."""

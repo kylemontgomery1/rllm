@@ -322,7 +322,7 @@ class UnifiedTrainer:
 
         await self.backend.on_train_start(trainer_state)
 
-        if hasattr(self, "_gateway"):
+        if hasattr(self, "_gateway") and self._gateway is not None:
             self._gateway.start(self.backend.rollout_engine)
 
         if self.rllm_config.trainer.get("val_before_train", True):
@@ -375,12 +375,23 @@ class UnifiedTrainer:
                     await self._train_batch_async(batch, trainer_state)
                 await self.backend.on_batch_end(trainer_state)
 
+                will_stop_before_validation = (
+                    use_total_batches
+                    and trainer_state.global_step >= self.rllm_config.trainer.total_batches
+                )
+                will_validate_this_step = (
+                    not will_stop_before_validation
+                    and self.rllm_config.trainer.test_freq > 0
+                    and trainer_state.global_step % self.rllm_config.trainer.test_freq == 0
+                )
+
                 print_metrics_table(trainer_state.metrics, trainer_state.global_step)
                 self.logger.log(
                     data=trainer_state.metrics,
                     step=trainer_state.global_step,
                     episodes=trainer_state.episodes,
                     trajectory_groups=trainer_state.trajectory_groups,
+                    commit=not will_validate_this_step,
                 )
 
                 # if the config specifies the `total_batches` parameter, then we check if we should stop
@@ -500,6 +511,7 @@ class UnifiedTrainer:
         total_tasks = len(train_dataloader) * self.rllm_config.trainer.total_epochs
         pbar = tqdm(total=total_tasks, desc="Tasks", unit="task")
         buffer._pbar = pbar
+        buffer.set_training_step(trainer_state.global_step)
 
         try:
             gen_task = asyncio.create_task(self._generation_loop(trainer_state, buffer, coordinator))
@@ -580,11 +592,14 @@ class UnifiedTrainer:
         rollout_engine = getattr(self.agent_workflow_engine, "rollout_engine", None)
 
         while True:
+            buffer.set_training_step(trainer_state.global_step)
             trainer_state.reset_batch()
             step_start = time.perf_counter()
             weight_versions = []
             all_trajectory_groups: list[TrajectoryGroup] = []
             all_episodes: list[Episode] = []
+            all_backend_datums = []
+            all_training_logprobs = []
             groups_consumed = 0
             buffer_wait_time = 0.0
             done = False
@@ -599,14 +614,14 @@ class UnifiedTrainer:
             for pass_idx in range(num_fwd_bwd_passes):
                 chunk_groups: list[TrajectoryGroup] = []
 
-                for _ in range(fwd_bwd_group_size):
-                    t_wait = time.perf_counter()
-                    task_batch = await buffer.get()
-                    buffer_wait_time += time.perf_counter() - t_wait
-                    if task_batch is None:
-                        done = True
-                        break
+                t_wait = time.perf_counter()
+                task_batches = await buffer.get_many(fwd_bwd_group_size)
+                buffer_wait_time += time.perf_counter() - t_wait
+                if task_batches is None:
+                    done = True
+                    break
 
+                for task_batch in task_batches:
                     coordinator.on_group_consumed()
                     groups_consumed += 1
 
@@ -623,13 +638,38 @@ class UnifiedTrainer:
                 trainer_state.trajectory_groups = chunk_groups
 
                 if trainer_state.has_trajectory_groups:
-                    logger.info(f"[TrainingLoop] Step {trainer_state.global_step}: fwd-bwd pass {pass_idx + 1}/{num_fwd_bwd_passes} ({len(chunk_groups)} groups)")
+                    fwd_bwd_start = time.perf_counter()
                     await self.backend.on_batch_start(trainer_state)
                     trainer_state.backend_batch = self.backend.transform_to_backend_batch(trainer_state)
                     await self.backend.process_backend_batch(trainer_state)
+                    fwd_bwd_time = time.perf_counter() - fwd_bwd_start
+                    if isinstance(trainer_state.backend_batch, dict):
+                        backend_datums = [datum for datums in trainer_state.backend_batch.values() for datum in datums]
+                    else:
+                        backend_datums = list(trainer_state.backend_batch or [])
+                    loss_tokens = float(trainer_state.metrics.get("train/active_tokens", 0.0) or 0.0)
+                    total_tokens = sum(
+                        getattr(datum.model_input, "length", 0)
+                        for datum in backend_datums
+                        if hasattr(datum, "model_input")
+                    )
+                    logger.info(
+                        "[TrainingLoop] Step %s: fwd-bwd pass %s/%s (%s groups, %s sequences, %s total tokens, %s loss tokens, %.2fs)",
+                        trainer_state.global_step,
+                        pass_idx + 1,
+                        num_fwd_bwd_passes,
+                        len(chunk_groups),
+                        len(backend_datums),
+                        total_tokens,
+                        int(loss_tokens),
+                        fwd_bwd_time,
+                    )
+                    all_backend_datums.extend(backend_datums)
+                    if "training_logprobs" in trainer_state.extra_info:
+                        all_training_logprobs.extend(trainer_state.extra_info["training_logprobs"])
 
                     # Drain per-chunk backend metrics into aggregator
-                    aggregator.record_dict(trainer_state.metrics)
+                    self._record_backend_metrics(aggregator, trainer_state.metrics)
                     trainer_state.metrics = {}
 
             # Only run optimizer step on a full batch
@@ -638,8 +678,10 @@ class UnifiedTrainer:
                 break
 
             # 2. Optimizer step
-            logger.info(f"[TrainingLoop] Step {trainer_state.global_step}: optimizer step")
+            optimizer_start = time.perf_counter()
             await self.backend.update_policy(trainer_state)
+            optimizer_time = time.perf_counter() - optimizer_start
+            logger.info(f"[TrainingLoop] Step {trainer_state.global_step}: optimizer step complete ({optimizer_time:.2f}s)")
 
             # 3. Capture pre-sync metrics (before weight sync resets coordinator state)
             staleness_values = [coordinator.weight_version - v for v in weight_versions]
@@ -669,6 +711,9 @@ class UnifiedTrainer:
             # Set all trajectory groups and stripped episodes for visualization/logging
             trainer_state.trajectory_groups = all_trajectory_groups
             trainer_state.episodes = all_episodes
+            trainer_state.backend_batch = all_backend_datums
+            if all_training_logprobs:
+                trainer_state.extra_info["training_logprobs"] = all_training_logprobs
 
             if self.tokenizer is not None and trainer_state.has_trajectory_groups:
                 visualize_trajectory_last_steps(
@@ -679,7 +724,20 @@ class UnifiedTrainer:
                 )
 
             # 5. Flush aggregator and merge pre-sync snapshots into trainer_state.metrics
-            trainer_state.metrics.update(aggregator.flush())
+            aggregated_metrics = aggregator.flush()
+            metric_collisions = set(trainer_state.metrics) & set(aggregated_metrics)
+            if metric_collisions:
+                logger.warning(
+                    "Optimizer metrics overlap with aggregated fwd-bwd metrics; keeping optimizer values for keys: %s",
+                    sorted(metric_collisions),
+                )
+            trainer_state.metrics = {**aggregated_metrics, **trainer_state.metrics}
+            trainer_state.metrics.update(
+                self._collect_consumed_sequence_metrics(
+                    trainer_state.trajectory_groups or [],
+                    trainer_state.backend_batch or [],
+                )
+            )
             trainer_state.metrics.update(pre_sync_buffer_stats)
             trainer_state.metrics.update(pre_sync_coordinator_stats)
 
@@ -690,6 +748,11 @@ class UnifiedTrainer:
             # 7. on_batch_end writes backend metrics (progress, optim, timing)
             await self.backend.on_batch_end(trainer_state)
 
+            will_validate_this_step = (
+                self.rllm_config.trainer.test_freq > 0
+                and trainer_state.global_step % self.rllm_config.trainer.test_freq == 0
+            )
+
             # 7. Print and log
             print_metrics_table(trainer_state.metrics, trainer_state.global_step)
             self.logger.log(
@@ -697,6 +760,7 @@ class UnifiedTrainer:
                 step=trainer_state.global_step,
                 episodes=trainer_state.episodes,
                 trajectory_groups=trainer_state.trajectory_groups,
+                commit=not will_validate_this_step,
             )
 
             # Periodic validation
@@ -796,7 +860,7 @@ class UnifiedTrainer:
         # post-process the val metrics to reduce any "list values" into scalars
         reduce_metrics_lists(val_metrics)
         print_metrics_table(val_metrics, trainer_state.global_step, title="Validation")
-        self.logger.log(data=val_metrics, step=trainer_state.global_step)
+        self.logger.log(data=val_metrics, step=trainer_state.global_step, commit=True)
         await self.backend.on_validation_end(trainer_state)
         return val_metrics
 
@@ -819,6 +883,87 @@ class UnifiedTrainer:
     # =========================================================================
     # Helper functions
     # =========================================================================
+    def _record_backend_metrics(self, aggregator: MetricsAggregator, metrics: dict) -> None:
+        active_tokens = float(metrics.get("train/active_tokens", metrics.get("train/num_loss_tokens", 0.0)) or 0.0)
+        response_tokens = active_tokens
+        num_sequences = float(metrics.get("train/num_sequences", 0.0) or 0.0)
+        icepop_tokens = float(metrics.get("icepop/active_tokens", 0.0) or 0.0)
+
+        token_weight_keys = {
+            "train/mean_kl",
+            "train/mean_loss",
+            "train/mean_adv_loss",
+            "train/mean_kl_penalty",
+            "train/dro_quad_penalty",
+        }
+        sequence_weight_keys = {
+            "train/inference_diff",
+            "train/inference_kld",
+            "train/dapo_clip_frac",
+            "train/ppo_clip_frac",
+            "train/cispo_clip_frac",
+            "train/gspo_clip_frac",
+            "train/ppo_ratio_mean",
+            "train/is_ratio_mean",
+            "train/tis/weight_mean",
+            "train/tis/clip_frac",
+            "train/tis/seq_ratio",
+        }
+        sum_keys = {
+            "train/active_tokens",
+            "train/microbatch_count",
+            "train/num_loss_tokens",
+            "train/num_sequences",
+            "icepop/active_tokens",
+        }
+
+        for key, value in metrics.items():
+            if not isinstance(value, int | float | np.number):
+                continue
+
+            if key.startswith("batch/seq_length/") or key.startswith("batch/seqs_per_traj/"):
+                continue
+            if key in {"train/entropy", "train/perplexity"}:
+                continue
+
+            if key in sum_keys:
+                aggregator.record(key, value, rule="sum")
+            elif key == "train/mask_ratio":
+                aggregator.record(key, value, rule="mean", weight=max(response_tokens, 1.0))
+            elif key in token_weight_keys:
+                aggregator.record(key, value, rule="mean", weight=max(active_tokens, 1.0))
+            elif key in sequence_weight_keys:
+                aggregator.record(key, value, rule="mean", weight=max(num_sequences, 1.0))
+            elif key.startswith("icepop/"):
+                aggregator.record(key, value, rule="mean", weight=max(icepop_tokens, 1.0))
+            elif key.startswith("train/"):
+                aggregator.record(key, value, weight=max(num_sequences or active_tokens or 1.0, 1.0))
+            else:
+                aggregator.record(key, value)
+
+    def _collect_consumed_sequence_metrics(self, trajectory_groups: list[TrajectoryGroup], backend_batch: list[Any]) -> dict[str, float]:
+        metrics = {}
+
+        seq_lengths = [datum.model_input.length for datum in backend_batch if hasattr(datum, "model_input")]
+        if seq_lengths:
+            metrics["batch/seq_length/mean"] = float(np.mean(seq_lengths))
+            metrics["batch/seq_length/min"] = float(np.min(seq_lengths))
+            metrics["batch/seq_length/max"] = float(np.max(seq_lengths))
+
+        trajectories = [trajectory for group in trajectory_groups for trajectory in group.trajectories]
+        if trajectories:
+            from rllm.trainer.tinker.transform import trajectory_to_datums
+
+            seqs_per_traj = [
+                len(trajectory_to_datums(trajectory, router_replay=self.algorithm_config.router_replay))
+                for trajectory in trajectories
+            ]
+            metrics["batch/seqs_per_traj/mean"] = float(np.mean(seqs_per_traj))
+            metrics["batch/seqs_per_traj/min"] = float(np.min(seqs_per_traj))
+            metrics["batch/seqs_per_traj/max"] = float(np.max(seqs_per_traj))
+
+        return metrics
+
     def _collect_workflow_metrics_from_episodes(self, episodes: list[Episode]) -> tuple[dict, Counter]:
         workflow_metrics = defaultdict(list)
         termination_counts = Counter()

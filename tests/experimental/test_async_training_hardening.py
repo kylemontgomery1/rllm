@@ -80,6 +80,38 @@ def test_transform_metrics_handle_all_filtered_groups():
     assert metrics["groups/min_group_size"] == 0
 
 
+def test_metrics_aggregator_accumulates_chunk_metrics_without_last_value_loss():
+    aggregator = MetricsAggregator()
+    aggregator.record("train/loss", 2.0, weight=10)
+    aggregator.record("train/loss", 4.0, weight=30)
+    aggregator.record("train/active_tokens", 10)
+    aggregator.record("train/active_tokens", 30)
+    aggregator.record("time/forward_backward", 3.0)
+    aggregator.record("time/forward_backward", 5.0)
+    aggregator.record("progress/batch", 7)
+    aggregator.record("progress/batch", 8)
+
+    metrics = aggregator.flush()
+
+    assert metrics["train/loss"] == pytest.approx(3.5)
+    assert metrics["train/active_tokens"] == 40.0
+    assert metrics["time/forward_backward"] == 8.0
+    assert metrics["progress/batch"] == 8.0
+
+
+def test_metrics_aggregator_pools_distribution_statistics():
+    aggregator = MetricsAggregator()
+    aggregator.record_distribution("reward/search", [0.0, 1.0])
+    aggregator.record_distribution("reward/search", [1.0, 1.0, 1.0])
+
+    metrics = aggregator.flush()
+
+    assert metrics["reward/search/mean"] == pytest.approx(0.8)
+    assert metrics["reward/search/std"] == pytest.approx(0.4)
+    assert metrics["reward/search/min"] == 0.0
+    assert metrics["reward/search/max"] == 1.0
+
+
 @pytest.mark.asyncio
 async def test_buffer_all_filtered_group_decrements_in_flight_without_queueing_batch():
     coordinator = SyncCoordinator(

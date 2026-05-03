@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from rllm.experimental.unified_trainer import TrainerState
 
 logger = logging.getLogger(__name__)
+logging.getLogger("fireworks.training.sdk.deployment").setLevel(logging.WARNING)
 
 
 class FireworksBackend(TinkerBackend):
@@ -169,16 +170,6 @@ class FireworksBackend(TinkerBackend):
         infra = self._to_infra_config(cfg.training_infra)
         deploy = self._to_deploy_config(cfg.deployment)
 
-        # When partial_rollout is enabled, the Fireworks server handles
-        # pausing/resuming in-flight generations during hot-load weight sync.
-        async_cfg = cfg.rllm.get("async_training", {})
-        if async_cfg.get("partial_rollout", False) and async_cfg.get("enable", False):
-            extra = list(deploy.deployment_extra_args or [])
-            if "--hot-load-async-transition" not in extra:
-                extra.append("--hot-load-async-transition")
-                deploy.deployment_extra_args = extra
-                logger.info("Added --hot-load-async-transition for partial_rollout mode")
-
         # Resolve training shape profile and auto-derive config values
         profile = None
         if infra.training_shape_id:
@@ -225,6 +216,7 @@ class FireworksBackend(TinkerBackend):
         self._policy_rc = ReconnectableClient(
             rlor_mgr, policy_ep.job_id, cfg.model.name,
             lora_rank=cfg.model.get("lora_rank", 0),
+            default_timeout=cfg.training.get("client_timeout", 600),
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -381,6 +373,14 @@ class FireworksBackend(TinkerBackend):
     # Policy update (override — no fused path, uses ReconnectableClient)
     # ------------------------------------------------------------------
 
+    async def process_backend_batch(
+        self,
+        trainer_state: TrainerState,
+        **kwargs,
+    ) -> None:
+        await super().process_backend_batch(trainer_state, **kwargs)
+        trainer_state.extra_info.pop("training_logprobs", None)
+
     async def update_policy(self, trainer_state: TrainerState, **kwargs) -> None:
         assert self.policy_trainer is not None, "policy_trainer is not initialized"
 
@@ -431,8 +431,7 @@ class FireworksBackend(TinkerBackend):
             )
 
         if should_sync:
-            with simple_timer("sync_weights", trainer_state.timing_dict):
-                snapshot_name = await self.policy_trainer.sync_weights(global_step)
+            snapshot_name = await self.policy_trainer.sync_weights(global_step)
 
             if should_save:
                 with simple_timer("save_checkpoint", trainer_state.timing_dict):
@@ -476,9 +475,10 @@ class FireworksBackend(TinkerBackend):
 
         learning_rate = trainer_state.extra_info.get("scheduled_learning_rate", self.learning_rate)
         update_training_metrics(trainer_state, learning_rate, trainer_state.total_steps)
-
-        if trainer_state.metrics:
-            print_metrics_table(trainer_state.metrics, trainer_state.global_step)
+        if trainer_state.backend_batch:
+            trainer_state.metrics.update(
+                self.policy_trainer._compute_rollout_entropy_metrics(trainer_state.backend_batch)
+            )
 
     def shutdown(self) -> None:
         """Cleanup Fireworks resources via ResourceCleanup."""

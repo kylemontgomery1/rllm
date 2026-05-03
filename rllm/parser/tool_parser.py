@@ -1,8 +1,11 @@
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 from rllm.tools.tool_base import ToolCall
+
+logger = logging.getLogger(__name__)
 
 
 class ToolParser(ABC):
@@ -240,7 +243,7 @@ class QwenToolParser(ToolParser):
                 # Convert to common format matching parse_tool_calls output
                 tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
             except json.JSONDecodeError:
-                print(f"Error parsing tool call: {json_content}")
+                logger.error("Error parsing tool call: %s", json_content)
                 text = text[end + len(self.tool_call_end) :]
                 continue
 
@@ -330,12 +333,12 @@ class TongyiDeepResearchToolParser(QwenToolParser):
                 call_data["arguments"]["code"] = code
                 tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
             except Exception as e:
-                print(f"Error parsing PythonInterpreter tool call: {json_content}, error: {e}")
+                logger.error("Error parsing PythonInterpreter tool call: %s, error: %s", json_content, e)
         else:
             try:
                 call_data = json5.loads(content)
                 tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
             except Exception as e:
-                print(f"Error parsing tool call: {content}, error: {e}")
+                logger.error("Error parsing tool call: %s, error: %s", content, e)
 
         return tool_calls

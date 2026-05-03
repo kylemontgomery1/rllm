@@ -67,8 +67,11 @@ class SyncCoordinator:
         self._in_flight = max(0, self._in_flight - 1)
 
     def on_group_filtered(self) -> None:
-        """Accumulator filtered out a group. Decrements in-flight count."""
+        """Accumulator filtered out a group. Releases in-flight and quota."""
         self._in_flight = max(0, self._in_flight - 1)
+        self._quota_used = max(0, self._quota_used - 1)
+        if self._quota_used < self.config.max_rollout_quota:
+            self._throttle_event.set()
 
     async def wait_for_throttle(self) -> None:
         """Generation loop blocks here when dispatch window is full."""

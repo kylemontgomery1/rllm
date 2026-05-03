@@ -202,7 +202,7 @@ class Tracking:
         if "ui" in default_backend:
             self.logger["ui"] = UILogger(project_name, experiment_name, config, source_metadata=source_metadata)
 
-    def log(self, data, step, backend=None, episodes=None, trajectory_groups=None):
+    def log(self, data, step, backend=None, episodes=None, trajectory_groups=None, commit=None):
         """Log metrics and optionally episodes/trajectory_groups to configured backends.
 
         Args:
@@ -216,6 +216,8 @@ class Tracking:
             if backend is None or default_backend in backend:
                 if default_backend == "ui":
                     logger_instance.log(data=data, step=step, episodes=episodes, trajectory_groups=trajectory_groups)
+                elif default_backend == "wandb" and commit is not None:
+                    logger_instance.log(data=data, step=step, commit=commit)
                 else:
                     logger_instance.log(data=data, step=step)
 

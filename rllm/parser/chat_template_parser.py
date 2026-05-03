@@ -105,7 +105,7 @@ class ChatTemplateParser:
         if isinstance(tokenizer.name_or_path, str):
             model_name = tokenizer.name_or_path.lower()
             tokenizer_cls = tokenizer.__class__.__name__.lower()
-            logger.info(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
+            logger.debug(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
             if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and ("llama" in tokenizer_cls or "distill-qwen" in model_name):
                 if "deepseek-math-v2" in model_name or "deepseek-v3.2-exp" in model_name:
                     logger.info(f"Using DeepSeekV32ExpChatTemplateParser for {tokenizer.name_or_path}")
@@ -117,7 +117,7 @@ class ChatTemplateParser:
                 logger.info(f"Using TongyiDeepResearchChatTemplateParser for {tokenizer.name_or_path}")
                 return TongyiDeepResearchChatTemplateParser(tokenizer)
             elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
-                logger.info(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
+                logger.debug(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
                 return QwenChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
             elif "llama" in model_name:
                 logger.info(f"Using LlamaChatTemplateParser for {tokenizer.name_or_path}")

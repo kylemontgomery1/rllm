@@ -23,6 +23,7 @@ training:
   weight_decay: 0.01
   grad_clip_norm: 1.0
   max_length: null  # Auto-derived from training shape if null
+  client_timeout: 600  # Timeout for forward / forward_backward / optim_step calls (seconds)
 
 deployment:
   deployment_id: "rllm-deploy-${now:%Y%m%d-%H%M%S}"

@@ -107,7 +107,7 @@ class UnifiedWorkflowEngine:
         assert self.executor is not None, "executor is not initialized"
         if self.workflow_queue is not None:
             return
-        logger.info(f"[WorkflowEngine] Initializing pool with {self.n_parallel_tasks} workflows")
+        logger.debug(f"[WorkflowEngine] Initializing pool with {self.n_parallel_tasks} workflows")
         self.workflow_queue = asyncio.Queue(maxsize=self.n_parallel_tasks)
         for i in range(self.n_parallel_tasks):
             workflow = self.workflow_cls(
@@ -118,7 +118,7 @@ class UnifiedWorkflowEngine:
             )
             assert workflow.is_multithread_safe(), "Workflows must contain only thread-save environments"
             self.workflow_queue.put_nowait(workflow)
-        logger.info(f"[WorkflowEngine] Pool initialized. Queue size: {self.workflow_queue.qsize()}")
+        logger.debug(f"[WorkflowEngine] Pool initialized. Queue size: {self.workflow_queue.qsize()}")
 
     async def process_task_with_retry(self, task: dict, task_id: str, rollout_idx: int, result_idx: int, **kwargs) -> tuple[str, int, int, Episode]:
         """Process a single task rollout with retry logic based on termination reasons.

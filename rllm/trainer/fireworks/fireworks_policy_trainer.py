@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -153,7 +155,7 @@ class FireworksPolicyTrainer:
             name,
             checkpoint_type=checkpoint_type,
         )
-        logger.info("Weights synced to deployment: %s", name)
+        logger.debug("Weights synced to deployment: %s", name)
         return snapshot_name
         
     # ------------------------------------------------------------------
@@ -229,6 +231,27 @@ class FireworksPolicyTrainer:
         lower = 1.0 / beta
         keep = (rho >= lower) & (rho <= beta)
         return torch.where(keep, rho, torch.zeros_like(rho)), rho, keep
+
+    @staticmethod
+    def _compute_rollout_entropy_metrics(datums: list[tinker.Datum]) -> dict[str, float]:
+        total_logprob = 0.0
+        total_tokens = 0
+        for datum in datums:
+            logprobs = datum.loss_fn_inputs["logprobs"].data
+            mask = datum.loss_fn_inputs["mask"].data
+            for lp, m in zip(logprobs, mask, strict=True):
+                if m:
+                    total_logprob += float(lp)
+                    total_tokens += 1
+
+        if total_tokens == 0:
+            return {}
+
+        entropy = -total_logprob / total_tokens
+        return {
+            "train/entropy": entropy,
+            "train/perplexity": math.exp(entropy),
+        }
 
     @classmethod
     def _build_icepop_builtin_loss_datums(
@@ -329,6 +352,7 @@ class FireworksPolicyTrainer:
             keeps = torch.cat(metric_keeps)
             metrics.update(
                 {
+                    "icepop/active_tokens": float(weights.numel()),
                     "icepop/weight_mean": weights.mean().item(),
                     "icepop/rho_mean": rhos.mean().item(),
                     "icepop/zero_frac": (~keeps).float().mean().item(),
@@ -415,6 +439,13 @@ class FireworksPolicyTrainer:
             algorithm_config=algorithm_config,
         )
 
+        adv_metrics["train/num_sequences"] = len(raw_datums)
+        adv_metrics["train/active_tokens"] = sum(
+            int(sum(datum.loss_fn_inputs["mask"].data))
+            for datum in raw_datums
+        )
+        adv_metrics.update(self._compute_rollout_entropy_metrics(raw_datums))
+
         rc = algorithm_config.rollout_correction
         clean_datums, advantages, inf_logprobs, prompt_lens, num_loss_tokens = self._process_datums(raw_datums)
 
@@ -426,10 +457,12 @@ class FireworksPolicyTrainer:
                 advantages[i] /= max(1, num_loss_tokens[i])
 
         # Proximal logprobs
+        t0 = time.perf_counter()
         if rc.bypass_mode:
             prox_logprobs = inf_logprobs
         else:
             prox_logprobs = await self._compute_proximal_logprobs(clean_datums)
+        adv_metrics["time/proximal_forward"] = time.perf_counter() - t0
 
         # Build datums for the builtin kernel.
         if rc.icepop_mode:
@@ -458,18 +491,13 @@ class FireworksPolicyTrainer:
             loss_fn_config=kernel_config,
         )
 
-        training_logprobs = []
-        for output in fwd_bwd_result.loss_fn_outputs:
-            logprobs = output["logprobs"].to_torch()
-            training_logprobs.append(logprobs)
-
         # Merge remote fwd/bwd metrics (e.g. loss) into adv_metrics
         if hasattr(fwd_bwd_result, "metrics") and fwd_bwd_result.metrics:
             for k, v in fwd_bwd_result.metrics.items():
                 if k not in self._METRIC_SKIP_KEYS:
                     adv_metrics[f"train/{k}"] = v
 
-        return clean_datums, training_logprobs, adv_metrics
+        return raw_datums, [], adv_metrics
 
     # ------------------------------------------------------------------
     # Optimizer step

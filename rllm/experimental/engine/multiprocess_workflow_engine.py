@@ -106,8 +106,8 @@ async def _worker_async_main(
     )
     await engine.initialize_pool()
 
-    probe = asyncio.create_task(_event_loop_probe(worker_id))
-    logger.info("Worker %d initialized: %d parallel tasks", worker_id, n_parallel_tasks)
+    # probe = asyncio.create_task(_event_loop_probe(worker_id))
+    logger.debug("Worker %d initialized: %d parallel tasks", worker_id, n_parallel_tasks)
 
     active_tasks: set[asyncio.Task] = set()
 
@@ -155,7 +155,7 @@ async def _worker_async_main(
             if t.exception():
                 logger.error("Worker %d drain exception: %s", worker_id, t.exception())
 
-    probe.cancel()
+    # probe.cancel()
     logger.info("Worker %d shut down", worker_id)
 
 
