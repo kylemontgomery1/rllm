@@ -887,7 +887,7 @@ class UnifiedTrainer:
         active_tokens = float(metrics.get("train/active_tokens", metrics.get("train/num_loss_tokens", 0.0)) or 0.0)
         response_tokens = active_tokens
         num_sequences = float(metrics.get("train/num_sequences", 0.0) or 0.0)
-        icepop_tokens = float(metrics.get("icepop/active_tokens", 0.0) or 0.0)
+        icepop_tokens = float(metrics.get("rollout_correction/icepop/active_tokens", 0.0) or 0.0)
 
         token_weight_keys = {
             "train/mean_kl",
@@ -909,12 +909,40 @@ class UnifiedTrainer:
             "train/tis/clip_frac",
             "train/tis/seq_ratio",
         }
+        offpolicy_token_weight_keys = {
+            "offpolicy/kl",
+            "offpolicy/k3_kl",
+            "offpolicy/logprob_abs_diff/mean",
+            "offpolicy/prob_abs_diff/mean",
+            "offpolicy/prob_pearson_corr",
+            "offpolicy/chi2_token",
+        }
+        offpolicy_sequence_weight_keys = {
+            "offpolicy/training_ppl",
+            "offpolicy/training_log_ppl",
+            "offpolicy/rollout_ppl",
+            "offpolicy/rollout_log_ppl",
+            "offpolicy/log_ppl_diff",
+            "offpolicy/log_ppl_abs_diff",
+            "offpolicy/ppl_ratio",
+            "offpolicy/chi2_seq",
+        }
+        rollout_correction_token_weight_keys = {
+            "rollout_correction/ratio/mean",
+        }
+        rollout_correction_icepop_token_weight_keys = {
+            "rollout_correction/icepop/weight/mean",
+            "rollout_correction/icepop/zero_frac",
+            "rollout_correction/icepop/low_frac",
+            "rollout_correction/icepop/high_frac",
+            "rollout_correction/icepop/seq_ratio/mean",
+        }
         sum_keys = {
             "train/active_tokens",
             "train/microbatch_count",
             "train/num_loss_tokens",
             "train/num_sequences",
-            "icepop/active_tokens",
+            "rollout_correction/icepop/active_tokens",
         }
 
         for key, value in metrics.items():
@@ -934,8 +962,30 @@ class UnifiedTrainer:
                 aggregator.record(key, value, rule="mean", weight=max(active_tokens, 1.0))
             elif key in sequence_weight_keys:
                 aggregator.record(key, value, rule="mean", weight=max(num_sequences, 1.0))
-            elif key.startswith("icepop/"):
+            elif key in offpolicy_token_weight_keys:
+                aggregator.record(key, value, rule="mean", weight=max(active_tokens, 1.0))
+            elif key in offpolicy_sequence_weight_keys:
+                aggregator.record(key, value, rule="mean", weight=max(num_sequences, 1.0))
+            elif key in rollout_correction_token_weight_keys:
+                aggregator.record(key, value, rule="mean", weight=max(active_tokens, 1.0))
+            elif key in rollout_correction_icepop_token_weight_keys:
                 aggregator.record(key, value, rule="mean", weight=max(icepop_tokens, 1.0))
+            elif key == "rollout_correction/ratio/max":
+                aggregator.record(key, value, rule="max")
+            elif key == "rollout_correction/ratio/min":
+                aggregator.record(key, value, rule="min")
+            elif key == "rollout_correction/icepop/weight/max":
+                aggregator.record(key, value, rule="max")
+            elif key == "rollout_correction/icepop/weight/min":
+                aggregator.record(key, value, rule="min")
+            elif key == "rollout_correction/icepop/seq_ratio/max":
+                aggregator.record(key, value, rule="max")
+            elif key == "rollout_correction/icepop/seq_ratio/min":
+                aggregator.record(key, value, rule="min")
+            elif key == "offpolicy/log_ppl_diff_max":
+                aggregator.record(key, value, rule="max")
+            elif key == "offpolicy/log_ppl_diff_min":
+                aggregator.record(key, value, rule="min")
             elif key.startswith("train/"):
                 aggregator.record(key, value, weight=max(num_sequences or active_tokens or 1.0, 1.0))
             else:

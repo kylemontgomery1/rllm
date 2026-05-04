@@ -253,6 +253,95 @@ class FireworksPolicyTrainer:
             "train/perplexity": math.exp(entropy),
         }
 
+    @staticmethod
+    def _compute_offpolicy_metrics(
+        old_logprobs: list[list[float]],
+        rollout_logprobs: list[list[float]],
+        masks: list[list[int]],
+    ) -> dict[str, float]:
+        import torch
+
+        safety_bound = 20.0
+        training_means = []
+        rollout_means = []
+        log_ratio_sums = []
+        token_old = []
+        token_rollout = []
+
+        for old_lp, rollout_lp, mask in zip(old_logprobs, rollout_logprobs, masks, strict=False):
+            active_old = []
+            active_rollout = []
+            for old, rollout, m in zip(old_lp, rollout_lp, mask, strict=False):
+                if m:
+                    active_old.append(float(old))
+                    active_rollout.append(float(rollout))
+            if not active_old:
+                continue
+
+            old_t = torch.tensor(active_old, dtype=torch.float32)
+            rollout_t = torch.tensor(active_rollout, dtype=torch.float32)
+            training_means.append(old_t.mean())
+            rollout_means.append(rollout_t.mean())
+            log_ratio_sums.append((old_t - rollout_t).sum())
+            token_old.append(old_t)
+            token_rollout.append(rollout_t)
+
+        if not token_old:
+            return {}
+
+        mean_log_prob_training = torch.stack(training_means)
+        mean_log_prob_rollout = torch.stack(rollout_means)
+        old_flat = torch.cat(token_old)
+        rollout_flat = torch.cat(token_rollout)
+        log_ratio = old_flat - rollout_flat
+        logprob_abs_diff = log_ratio.abs()
+        old_prob = torch.exp(old_flat)
+        rollout_prob = torch.exp(rollout_flat)
+        prob_abs_diff = (old_prob - rollout_prob).abs()
+        log_ratio_safe = torch.clamp(log_ratio, min=-safety_bound, max=safety_bound)
+        ratio = torch.exp(log_ratio_safe)
+        log_ppl_diff = mean_log_prob_rollout - mean_log_prob_training
+
+        metrics = {
+            "offpolicy/kl": (rollout_flat - old_flat).mean().item(),
+            "offpolicy/k3_kl": (torch.exp(log_ratio) - log_ratio - 1).mean().item(),
+            "offpolicy/logprob_abs_diff/mean": logprob_abs_diff.mean().item(),
+            "offpolicy/logprob_abs_diff/min": logprob_abs_diff.min().item(),
+            "offpolicy/logprob_abs_diff/max": logprob_abs_diff.max().item(),
+            "offpolicy/prob_abs_diff/mean": prob_abs_diff.mean().item(),
+            "offpolicy/prob_abs_diff/min": prob_abs_diff.min().item(),
+            "offpolicy/prob_abs_diff/max": prob_abs_diff.max().item(),
+            "offpolicy/training_ppl": torch.exp(-mean_log_prob_training).mean().item(),
+            "offpolicy/training_log_ppl": (-mean_log_prob_training).mean().item(),
+            "offpolicy/rollout_ppl": torch.exp(-mean_log_prob_rollout).mean().item(),
+            "offpolicy/rollout_log_ppl": (-mean_log_prob_rollout).mean().item(),
+            "offpolicy/log_ppl_diff": log_ppl_diff.mean().item(),
+            "offpolicy/log_ppl_abs_diff": log_ppl_diff.abs().mean().item(),
+            "offpolicy/log_ppl_diff_min": log_ppl_diff.min().item(),
+            "offpolicy/log_ppl_diff_max": log_ppl_diff.max().item(),
+            "offpolicy/ppl_ratio": torch.exp(log_ppl_diff).mean().item(),
+            "rollout_correction/ratio/mean": ratio.mean().item(),
+            "rollout_correction/ratio/min": ratio.min().item(),
+            "rollout_correction/ratio/max": ratio.max().item(),
+        }
+
+        if old_prob.numel() > 1:
+            old_centered = old_prob - old_prob.mean()
+            rollout_centered = rollout_prob - rollout_prob.mean()
+            denom = torch.sqrt(old_centered.square().sum() * rollout_centered.square().sum())
+            if denom.item() > 0.0:
+                metrics["offpolicy/prob_pearson_corr"] = (
+                    (old_centered * rollout_centered).sum() / denom
+                ).item()
+
+        metrics["offpolicy/chi2_token"] = (ratio.square().mean() - 1.0).item()
+
+        log_ratio_sum = torch.stack(log_ratio_sums)
+        log_ratio_sum_safe = torch.clamp(log_ratio_sum, min=-safety_bound, max=safety_bound)
+        metrics["offpolicy/chi2_seq"] = (torch.exp(2.0 * log_ratio_sum_safe).mean() - 1.0).item()
+
+        return metrics
+
     @classmethod
     def _build_icepop_builtin_loss_datums(
         cls,
@@ -352,16 +441,19 @@ class FireworksPolicyTrainer:
             keeps = torch.cat(metric_keeps)
             metrics.update(
                 {
-                    "icepop/active_tokens": float(weights.numel()),
-                    "icepop/weight_mean": weights.mean().item(),
-                    "icepop/rho_mean": rhos.mean().item(),
-                    "icepop/zero_frac": (~keeps).float().mean().item(),
-                    "icepop/low_frac": (rhos < (1.0 / icepop_beta)).float().mean().item(),
-                    "icepop/high_frac": (rhos > icepop_beta).float().mean().item(),
+                    "rollout_correction/icepop/active_tokens": float(weights.numel()),
+                    "rollout_correction/icepop/weight/mean": weights.mean().item(),
+                    "rollout_correction/icepop/weight/min": weights.min().item(),
+                    "rollout_correction/icepop/weight/max": weights.max().item(),
+                    "rollout_correction/icepop/zero_frac": (~keeps).float().mean().item(),
+                    "rollout_correction/icepop/low_frac": (rhos < (1.0 / icepop_beta)).float().mean().item(),
+                    "rollout_correction/icepop/high_frac": (rhos > icepop_beta).float().mean().item(),
                 }
             )
             if icepop_mode == "sequence":
-                metrics["icepop/seq_ratio_mean"] = rhos.mean().item()
+                metrics["rollout_correction/icepop/seq_ratio/mean"] = rhos.mean().item()
+                metrics["rollout_correction/icepop/seq_ratio/min"] = rhos.min().item()
+                metrics["rollout_correction/icepop/seq_ratio/max"] = rhos.max().item()
 
         return result, metrics
 
@@ -462,6 +554,13 @@ class FireworksPolicyTrainer:
             prox_logprobs = inf_logprobs
         else:
             prox_logprobs = await self._compute_proximal_logprobs(clean_datums)
+        adv_metrics.update(
+            self._compute_offpolicy_metrics(
+                old_logprobs=prox_logprobs,
+                rollout_logprobs=inf_logprobs,
+                masks=[list(datum.loss_fn_inputs["mask"].data) for datum in raw_datums],
+            )
+        )
         adv_metrics["time/proximal_forward"] = time.perf_counter() - t0
 
         # Build datums for the builtin kernel.
@@ -556,35 +655,33 @@ class FireworksPolicyTrainer:
     # ------------------------------------------------------------------
 
     @require_training_client
-    async def sync_weights(self, step: int) -> str | None:
+    async def sync_weights(self, step: int, checkpoint_type: str | None = None) -> str | None:
         """Hot-load current weights into the inference deployment.
 
         Returns the snapshot_name on success, None on failure."""
-        return await self._sync_weights(f"step-{step}")
+        return await self._sync_weights(f"step-{step}", checkpoint_type=checkpoint_type)
 
     async def promote_checkpoint(self, snapshot_name: str, output_model_id: str) -> None:
         """Promote a sampler checkpoint to a deployable Fireworks model."""
         if self._rlor_mgr is None or self._policy_job_id is None:
             logger.warning("Cannot promote: rlor_mgr or policy_job_id not set")
             return
-        try:
-            await asyncio.to_thread(
-                self._rlor_mgr.promote_checkpoint,
-                self._policy_job_id,
-                snapshot_name,
-                output_model_id,
-            )
-            logger.info("Promoted checkpoint '%s' -> model '%s'", snapshot_name, output_model_id)
-        except Exception:
-            logger.exception("Failed to promote checkpoint '%s'", snapshot_name)
-            raise
+        await asyncio.to_thread(
+            self._rlor_mgr.promote_checkpoint,
+            self._policy_job_id,
+            snapshot_name,
+            output_model_id,
+            self.config.model.name,
+        )
+        logger.info("Promoted checkpoint '%s' -> model '%s'", snapshot_name, output_model_id)
 
     @require_training_client
     async def save_dcp_checkpoint(self, step: int) -> None:
-        """Save a DCP checkpoint via WeightSyncer (includes dcp_timeout)."""
+        """Save a DCP checkpoint for resume."""
         name = f"step-{step}"
+        timeout = self.config.hotload.get("dcp_timeout", 2700)
         try:
-            await asyncio.to_thread(self.weight_syncer.save_dcp, name)
+            await asyncio.to_thread(self.training_client.save_state, name, timeout=timeout)
             logger.info("DCP checkpoint saved: %s", name)
         except Exception:
             logger.exception("Failed to save DCP checkpoint %s", name)

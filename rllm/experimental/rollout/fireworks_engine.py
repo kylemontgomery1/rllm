@@ -40,7 +40,15 @@ from rllm.workflows import TerminationEvent, TerminationReason
 logger = logging.getLogger(__name__)
 
 _MAX_SAMPLE_ATTEMPTS = 5
-_TRANSIENT_ERROR_CODES = ("502", "503", "425", "Connection", "incomplete chunked read")
+_TRANSIENT_ERROR_MARKERS = (
+    "502",
+    "503",
+    "425",
+    "Connection",
+    "incomplete chunked read",
+    "_SSETruncationError",
+    "closed the SSE stream mid-generation",
+)
 
 
 class _EmptyCompletionIdsError(RuntimeError):
@@ -318,8 +326,9 @@ class FireworksEngine(TinkerEngine):
                 return result, metrics_dict
             except Exception as exc:
                 err = str(exc)
+                exc_name = exc.__class__.__name__
                 transient = isinstance(exc, _EmptyCompletionIdsError) or any(
-                    code in err for code in _TRANSIENT_ERROR_CODES
+                    marker in err or marker in exc_name for marker in _TRANSIENT_ERROR_MARKERS
                 )
                 if transient and attempt < _MAX_SAMPLE_ATTEMPTS - 1:
                     wait = 10 * (attempt + 1)

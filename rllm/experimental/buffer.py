@@ -342,13 +342,20 @@ class TrajectoryGroupBuffer:
                 except (TypeError, ValueError):
                     continue
 
-            # Episode-level totals across all trajectories
+            # Episode-level turn counts across all trajectories
             total_turns = sum(len(traj.steps) for traj in ep.trajectories)
-            total_prompt_tokens = sum(len(s.prompt_ids) for traj in ep.trajectories for s in traj.steps)
-            total_response_tokens = sum(len(s.response_ids) for traj in ep.trajectories for s in traj.steps)
-            self._aggregator.record("episode/num_turns", total_turns, rule="mean")
-            self._aggregator.record("episode/prompt_tokens", total_prompt_tokens, rule="mean")
-            self._aggregator.record("episode/response_tokens", total_response_tokens, rule="mean")
+            self._aggregator.record("episode/num_turns/min", total_turns, rule="min")
+            self._aggregator.record("episode/num_turns/mean", total_turns, rule="mean")
+            self._aggregator.record("episode/num_turns/max", total_turns, rule="max")
+            response_lengths = [len(s.response_ids) for traj in ep.trajectories for s in traj.steps]
+            total_response_tokens = sum(response_lengths)
+            self._aggregator.record("episode/total_response_tokens/min", total_response_tokens, rule="min")
+            self._aggregator.record("episode/total_response_tokens/mean", total_response_tokens, rule="mean")
+            self._aggregator.record("episode/total_response_tokens/max", total_response_tokens, rule="max")
+            for response_length in response_lengths:
+                self._aggregator.record("episode/response_length/mean", response_length, rule="mean")
+                self._aggregator.record("episode/response_length/min", response_length, rule="min")
+                self._aggregator.record("episode/response_length/max", response_length, rule="max")
             self._aggregator.record("episode/correct", 1.0 if ep.is_correct else 0.0)
 
     def _record_transform_metrics(self, metrics: dict) -> None:

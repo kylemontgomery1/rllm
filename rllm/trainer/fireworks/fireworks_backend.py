@@ -236,10 +236,10 @@ class FireworksBackend(TinkerBackend):
             deployment_id=deployment_id,
             base_model=cfg.model.name,
             hotload_timeout=cfg.hotload.hot_load_timeout,
-            dcp_timeout=cfg.hotload.get("dcp_timeout", 2700),
             warmup_after_hotload=cfg.hotload.get("warmup_after_hotload", True),
             warmup_max_retries=cfg.hotload.get("warmup_max_retries", 10),
             reset_prompt_cache=cfg.hotload.get("reset_prompt_cache", True),
+            lora_rank=cfg.model.get("lora_rank", 0),
         )
 
     # ------------------------------------------------------------------
@@ -431,16 +431,32 @@ class FireworksBackend(TinkerBackend):
             )
 
         if should_sync:
-            snapshot_name = await self.policy_trainer.sync_weights(global_step)
+            checkpoint_type = "base" if should_save else None
+            snapshot_name = await self.policy_trainer.sync_weights(
+                global_step,
+                checkpoint_type=checkpoint_type,
+            )
 
             if should_save:
                 with simple_timer("save_checkpoint", trainer_state.timing_dict):
                     await self.policy_trainer.save_dcp_checkpoint(global_step)
                 if snapshot_name:
                     experiment = self.full_config.rllm.trainer.get("experiment_name", "default")
-                    await self.policy_trainer.promote_checkpoint(
-                        snapshot_name, f"{experiment}-step-{global_step}",
-                    )
+                    output_model_id = f"{experiment}-step-{global_step}"
+                    try:
+                        await self.policy_trainer.promote_checkpoint(
+                            snapshot_name,
+                            output_model_id,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Checkpoint promotion failed for '%s' -> '%s'; continuing because "
+                            "the DCP checkpoint was saved. Error: %s",
+                            snapshot_name,
+                            output_model_id,
+                            exc,
+                            exc_info=True,
+                        )
 
     async def on_train_end(self, trainer_state: TrainerState) -> None:
         assert self.policy_trainer is not None, "policy_trainer is not initialized"
