@@ -25,6 +25,7 @@ from fireworks.training.sdk import (
     TrainerJobManager,
     WeightSyncer,
 )
+from fireworks.training.sdk.deployment import AdaptiveConcurrencyController
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 
@@ -199,11 +200,23 @@ class FireworksBackend(TinkerBackend):
             cfg.deployment.get("tokenizer_model") or cfg.model.name,
             trust_remote_code=True,
         )
+        # Adaptive concurrency: throttle in-flight rollout sampling requests
+        # based on server-side prefill queue duration. Without this, a burst
+        # of long-context generations can saturate the deployment and tank
+        # per-request decode throughput. Mirrors cookbook rl_loop's defaults.
+        cc = cfg.get("concurrency", {})
+        concurrency_controller = AdaptiveConcurrencyController(
+            initial_window=cc.get("initial_window") or (8 * bundle.deployment_gpu_count),
+            min_window=cc.get("min_window", 1),
+            max_window=cc.get("max_window", 256),
+            prefill_queue_target=cc.get("prefill_queue_target", 2.0),
+        )
         self.sampling_client = DeploymentSampler(
             inference_url=deploy_mgr.inference_url,
             model=bundle.inference_model or cfg.model.name,
             api_key=api_key,
             tokenizer=self.tokenizer,
+            concurrency_controller=concurrency_controller,
         )
         self.weight_syncer = WeightSyncer(
             policy_client=self._policy_rc.inner,
