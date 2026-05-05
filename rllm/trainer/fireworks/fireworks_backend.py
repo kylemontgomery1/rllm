@@ -11,15 +11,12 @@ from __future__ import annotations
 
 import logging
 import os
-import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from training.utils import (
     ReconnectableClient,
     ResourceCleanup,
-    create_trainer_job,
-    setup_deployment,
+    setup_infra,
 )
 from training.utils.config import DeployConfig, InfraConfig
 from fireworks.training.sdk import (
@@ -117,6 +114,7 @@ class FireworksBackend(TinkerBackend):
         self._rlor_mgr: TrainerJobManager | None = None
         self._deploy_mgr: DeploymentManager | None = None
         self._cleanup: ResourceCleanup | None = None
+        self._closeables: list = []
 
     # ------------------------------------------------------------------
     # Fireworks infrastructure setup
@@ -155,8 +153,7 @@ class FireworksBackend(TinkerBackend):
         )
 
     def _init_fireworks_infra(self, **kwargs) -> None:
-        """Create Fireworks TrainerJobManager, DeploymentManager,
-        ReconnectableClient, WeightSyncer, and DeploymentSampler."""
+        """Provision trainer + deployment via cookbook ``setup_infra``."""
         cfg = self.full_config
         api_key = os.environ["FIREWORKS_API_KEY"]
         base_url = cfg.get("fireworks_base_url", "https://api.fireworks.ai")
@@ -167,31 +164,6 @@ class FireworksBackend(TinkerBackend):
         self._deploy_mgr = deploy_mgr
         self._cleanup = ResourceCleanup(rlor_mgr, deploy_mgr)
 
-        infra = self._to_infra_config(cfg.training_infra)
-        deploy = self._to_deploy_config(cfg.deployment)
-
-        # Resolve training shape profile and auto-derive config values
-        profile = None
-        if infra.training_shape_id:
-            profile = rlor_mgr.resolve_training_profile(infra.training_shape_id)
-            dep_shape = getattr(profile, "deployment_shape", None) or getattr(profile, "deployment_shape_version", None)
-            if dep_shape and not deploy.deployment_shape:
-                deploy.deployment_shape = dep_shape
-                logger.info("Auto-derived deployment_shape from training shape: %s", dep_shape)
-            if profile.max_supported_context_length and not cfg.training.get("max_length"):
-                cfg.training.max_length = profile.max_supported_context_length
-                logger.info("Auto-derived max_length from training shape: %d", cfg.training.max_length)
-            pp = getattr(profile, "pipeline_parallelism", 1)
-            if pp > 1:
-                raise ValueError(
-                    f"Pipeline parallelism (PP={pp}) is not supported. "
-                    f"Use a training shape with PP=1."
-                )
-
-        dep_info = setup_deployment(deploy_mgr, deploy, cfg.model.name, infra)
-        deployment_id = deploy.deployment_id
-        self._cleanup.deployment(deployment_id, action="delete")
-
         kl_beta = cfg.rllm.algorithm.get("kl_beta", 0.0)
         if kl_beta > 0:
             raise ValueError(
@@ -199,41 +171,44 @@ class FireworksBackend(TinkerBackend):
                 f"Set kl_beta=0 in your config."
             )
 
-        policy_ep = create_trainer_job(
-            rlor_mgr,
+        bundle = setup_infra(
+            rlor_mgr=rlor_mgr,
+            deploy_mgr=deploy_mgr,
             base_model=cfg.model.name,
-            infra=infra,
-            profile=profile,
+            infra_cfg=self._to_infra_config(cfg.training_infra),
+            deploy_cfg=self._to_deploy_config(cfg.deployment),
             lora_rank=cfg.model.get("lora_rank", 0),
-            max_seq_len=cfg.training.max_length,
+            max_seq_len=cfg.training.get("max_length"),
             learning_rate=cfg.training.learning_rate,
-            display_name=f"rllm-policy-{int(time.time())}",
-            hot_load_deployment_id=deployment_id,
+            step_timeout=cfg.training.get("client_timeout", 600),
+            needs_reference=False,
+            needs_inference=True,
+            role_prefix="rllm",
+            api_key=api_key,
             cleanup=self._cleanup,
         )
 
-        self._policy_job_id = policy_ep.job_id
-        self._policy_rc = ReconnectableClient(
-            rlor_mgr, policy_ep.job_id, cfg.model.name,
-            lora_rank=cfg.model.get("lora_rank", 0),
-            default_timeout=cfg.training.get("client_timeout", 600),
-        )
+        if cfg.training.get("max_length") is None:
+            cfg.training.max_length = bundle.max_seq_len
+
+        self._policy_job_id = bundle.policy_job_id
+        self._policy_rc = bundle.policy
+        self._closeables = list(bundle.closeables)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            deploy.tokenizer_model or cfg.model.name,
+            cfg.deployment.get("tokenizer_model") or cfg.model.name,
             trust_remote_code=True,
         )
-        inference_model = dep_info.inference_model if dep_info else cfg.model.name
         self.sampling_client = DeploymentSampler(
             inference_url=deploy_mgr.inference_url,
-            model=inference_model,
+            model=bundle.inference_model or cfg.model.name,
             api_key=api_key,
             tokenizer=self.tokenizer,
         )
         self.weight_syncer = WeightSyncer(
             policy_client=self._policy_rc.inner,
             deploy_mgr=deploy_mgr,
-            deployment_id=deployment_id,
+            deployment_id=bundle.deployment_id,
             base_model=cfg.model.name,
             hotload_timeout=cfg.hotload.hot_load_timeout,
             warmup_after_hotload=cfg.hotload.get("warmup_after_hotload", True),
@@ -498,5 +473,11 @@ class FireworksBackend(TinkerBackend):
 
     def shutdown(self) -> None:
         """Cleanup Fireworks resources via ResourceCleanup."""
+        for closeable in self._closeables:
+            try:
+                closeable.close()
+            except Exception:
+                logger.exception("Error closing infra resource %r", closeable)
+        self._closeables = []
         if self._cleanup:
             self._cleanup.__exit__(None, None, None)
