@@ -1,0 +1,204 @@
+# Common, backend-agnostic configuration for rLLM
+# Agent Configuration
+agent:
+  name: math_agent
+  max_steps: 20
+  trajectory_timeout: null
+  overlong_filter: False
+  agent_args: {}
+  engine_args: {}
+
+# Environment Configuration
+env:
+  name: custom
+  env_args: {}
+
+# Workflow Configuration
+workflow:
+  use_workflow: False
+  name: single_turn_workflow
+  workflow_args:
+    agent_cls: null
+    agent_args: {}
+    env_cls: null
+    env_args: {}
+    timeout: 1e6
+    gamma: 0.0 # no discounting
+    reward_bonus_coeff: 0.0 # no reward shaping
+  n_parallel_tasks: 256
+  n_workers: 1
+  retry_limit: 3
+  raise_on_error: true
+
+# Rollout Configuration
+rollout:
+  n: 8 # group size
+  n_val: 1  # number of validation samples per prompt
+  sampling:
+    train:
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+    val:
+      temperature: ${..train.temperature}
+      top_p: ${..train.top_p}
+      top_k: ${..train.top_k}
+  chat_template_kwargs:
+    disable_thinking: ${...disable_thinking} # Disable thinking
+    accumulate_reasoning: ${...accumulate_reasoning} # Accumulate reasoning
+    reasoning_effort: medium # low, medium, high
+
+# Trainer Configuration
+trainer:
+  total_epochs: 10
+  total_batches: -1
+  logger: ['console']  # Options: 'console', 'wandb', 'tensorboard'
+  project_name: 'rllm-training'
+  experiment_name: 'default'
+  test_freq: 5
+  save_freq: 20
+  val_before_train: false
+  val_only: false
+
+# Algorithm Configuration
+algorithm:
+  adv_estimator: grpo # [grpo, reinforce, reinforce_plus_plus_baseline, rloo]
+  norm_adv_by_std_in_grpo: true
+  use_precomputed_advantage: false # When true, use step.advantage from the workflow (e.g. distillation) instead of computing it from rewards
+  # Loss function
+  # verl: vanilla, dppo_tv, dppo_kl, gspo, sapo, gpg, clip_cov, kl_cov, geo_mean, cispo
+  # tinker: importance_sampling, ppo, cispo, dro
+  # null defauls to backend's default
+  loss_fn: null
+  loss_agg_mode: null     # [null, token-mean, seq-mean-token-sum, seq-mean-token-mean, seq-mean-token-mean-norm]
+  kl_beta: 0.0            # KL penalty coefficient
+  eps_clip: 0.2           # PPO clip epsilon
+  eps_clip_high: null     # Asymmetric upper clip bound (null = symmetric)
+  router_replay: false    # Router Replay (R3): replay MoE expert routing from inference during training
+  mask_truncated_samples: ${..mask_truncated_samples}  # Mask truncated samples
+  rollout_correction:
+    bypass_mode: null     # true = pi_old = pi_rollout, false = pi_old is computed (null = backend default)
+    tis_mode: null        # null = disabled, "token" or "sequence" = TIS importance sampling level
+    tis_cap: 2.0          # Upper clamp on TIS importance weight
+    rs_mode: null         # null = disabled; token_k{1,2,3} / seq_sum_k{1,2,3} / seq_mean_k{1,2,3} / seq_max_k{2,3}, comma-chained
+    rs_threshold: null    # "lower_upper" for k1 (e.g. "0.1_1.2"); upper bound for k2/k3
+    icepop_mode: null     # null = disabled, "token" or "sequence" = hard two-sided IcePop pop(rho, 1/beta, beta)
+    icepop_beta: 2.0      # IcePop keeps rho inside [1/beta, beta], zeros it outside
+
+# Stepwise advantage
+# TODO(listar2000): deprecate the `per_step` mode and refactor this config.
+stepwise_advantage:
+  enable: False
+  mode: broadcast # support `broadcast` only now
+  normalize_by_steps: False
+
+# Deprecated
+disable_thinking: False # (moved to rollout.chat_template_kwargs)
+accumulate_reasoning: False # (moved to rollout.chat_template_kwargs)
+mask_truncated_samples: False # (moved to algorithm.mask_truncated_samples)
+
+# Compact filtering
+compact_filtering:
+  enable: False
+  mask_max_prompt_length_exceeded: True
+  mask_max_response_length_exceeded: True
+  mask_env_done: False
+  mask_max_turns_exceeded: True
+  mask_timeout: True
+  mask_unknown: False
+  mask_error: True
+  mask_format_error: False
+
+# Rejection sampling
+rejection_sample:
+  enable: False
+  multiplier: 1
+  min_partial_solve_tasks: 1
+  min_trajs_per_group: 2
+  filter_uniform_groups: false
+
+# SDK Configuration
+# DEPRECATED: This section is only kept for backward compatibility with
+# standalone SDK usage (rllm/sdk/). The unified trainer no longer uses the
+# SDK/agent_run_func path — use AgentFlow + Evaluator instead.
+sdk:
+  store:
+    path: ~/.rllm/traces.db
+  processing:
+    groupby_key: null
+    traj_name_key: null
+  proxy:
+    host: 127.0.0.1
+    port: 4000
+    mode: subprocess  # external | subprocess
+    admin_token: my-shared-secret
+  sandbox:
+    enabled: false
+    backend: local  # local | docker | modal | agentcore
+    agent_dir: ""
+    agent_module: agent
+    agent_func: rollout
+    image: "python:3.11-slim"
+    dockerfile: ""
+    requirements_file: ""
+    install_rllm_sdk: true
+    pool_mode: persistent  # persistent | per_task
+    num_workers: 8
+    worker_port: 8100
+    max_concurrent: 32
+    task_setup_commands: []
+    task_setup_timeout: 300
+    teardown_on_complete: true
+    execution_timeout: 600.0
+    setup_commands: []
+    # Backend-specific configuration.
+    # For agentcore backend:
+    #   agent_runtime_arn: ARN of the AgentCore runtime (required)
+    #   base_url: Reachable proxy URL for the ACR container, e.g. http://<host-ip>:4000/v1
+    #             Required unless the proxy is publicly reachable at its default address.
+    #   tps_limit: Max concurrent invocations (default: 25)
+    #   max_retry_attempts: boto3 adaptive retry attempts (default: 5)
+    extra: {}
+
+# Remote Runtime Configuration (for agent-in-container runtimes like AgentCore, Harbor)
+remote_runtime:
+  enabled: false
+  backend: agentcore   # agentcore | harbor
+  # Per-backend named sub-configs. Only the sub-dict matching `backend` is read.
+  agentcore:
+    agent_runtime_arn: ""
+    s3_bucket: ""
+    tps_limit: 25
+  harbor:
+    agent: mini-swe-agent       # scaffold name (mini-swe-agent | aider | openhands | swe-agent | qwen-coder | ...)
+    environment_type: docker    # docker | modal | daytona | e2b | runloop | gke | apple-container
+    agent_kwargs: {}            # pass-through to harbor's AgentConfig.kwargs (scaffold-specific flags)
+    agent_timeout_multiplier: null
+    verifier_timeout_multiplier: null
+    agent_setup_timeout_multiplier: null
+    environment_build_timeout_multiplier: null
+  session_timeout: 300.0
+
+# Gateway Configuration (model gateway for AgentFlow-based training)
+gateway:
+  port: 9090
+  host: null          # Auto-detects routable IP; set explicitly to override
+  public_url: null    # Public URL for remote agents (e.g. http://<tunnel-host>:9090); defaults to http://<host>:<port>
+  db_path: null       # Defaults to temp file
+  sampling_params_priority: session   # "session" | "client" — who wins when both set the same key
+
+# Async Training Configuration
+async_training:
+  enable: false
+  mini_batch_size: 64
+  fwd_bwd_group_size: null  # task batches per forward-backward pass (default: mini_batch_size)
+  staleness_threshold: 0.0
+  trigger_parameter_sync_step: 1
+  partial_rollout: false
+  episode_offload_dir: null       # NVMe offload dir for pending episodes (null = disabled)
+  trajectory_group_offload_dir: null  # NVMe offload dir for queued task batches (null = disabled)
+
+# Episode Logging Configuration
+episode_logging:
+  log_episodes: false
+  episode_log_dir: logs/${rllm.trainer.project_name}/${rllm.trainer.experiment_name}

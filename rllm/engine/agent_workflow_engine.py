@@ -1,16 +1,19 @@
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 from tqdm import tqdm
 
 from rllm.agents.agent import Episode
-from rllm.engine.rollout import ModelOutput, RolloutEngine
+from rllm.engine.rollout import RolloutEngine
 from rllm.utils import colorful_print
 from rllm.workflows.workflow import TerminationReason, Workflow
 
@@ -22,7 +25,19 @@ logger = logging.getLogger(__name__)
 
 
 class AgentWorkflowEngine:
-    def __init__(self, workflow_cls: type[Workflow], workflow_args: dict, rollout_engine: RolloutEngine, config=None, n_parallel_tasks: int = 128, retry_limit: int = 3, raise_on_error: bool = True, episode_logger=None, **kwargs):
+    def __init__(
+        self,
+        workflow_cls: type[Workflow],
+        workflow_args: dict,
+        rollout_engine: RolloutEngine,
+        config=None,
+        n_parallel_tasks: int = 128,
+        retry_limit: int = 3,
+        raise_on_error: bool = True,
+        episode_logger=None,
+        output_dir: str | None = None,
+        **kwargs,
+    ):
         """Initialize the AgentWorkflowEngine.
 
         Args:
@@ -34,6 +49,7 @@ class AgentWorkflowEngine:
             retry_limit: Maximum number of retry attempts for failed tasks.
             raise_on_error: Whether to raise exceptions on permanent failures.
             episode_logger: Optional logger for saving episode data to files.
+            output_dir: Optional directory for per-episode JSON output.
             **kwargs: Additional keyword arguments.
         """
         self.workflow_cls = workflow_cls
@@ -51,6 +67,7 @@ class AgentWorkflowEngine:
         self.workflow_queue = None
 
         # Episode logging support
+        self.output_dir = Path(output_dir) if output_dir else None
         self.episode_logger = episode_logger
         self.current_step = 0
         self.current_epoch = 0
@@ -104,9 +121,16 @@ class AgentWorkflowEngine:
                 uid = f"{task_id}:{rollout_idx}"
                 episode = await workflow.run_with_termination_handling(task=task, uid=uid, **kwargs)
 
-                # Display rewards for all trajectories
-                rewards_str = ", ".join([f"{traj.name}: {traj.reward:.1f}" for traj in episode.trajectories])
-                colorful_print(f"[{uid}] Rollout completed. Rewards: {rewards_str}, Termination: {episode.termination_reason}", fg="green" if episode.is_correct else "yellow")
+                # Display rewards for all trajectories. Fallback to last step reward if trajectory reward is not set.
+                reward_strs = []
+                for traj in episode.trajectories:
+                    reward = "N/A"
+                    if traj.reward is not None:
+                        reward = f"{traj.reward:.1f}"
+                    elif len(traj.steps) > 0:
+                        reward = f"{traj.steps[-1].reward:.1f}"
+                    reward_strs.append(f"{traj.name}: {reward}")
+                colorful_print(f"[{uid}] Rollout completed. Rewards: {reward_strs}, Termination: {episode.termination_reason}", fg="green" if episode.is_correct else "yellow")
 
                 if episode.termination_reason != TerminationReason.ERROR:
                     return task_id, rollout_idx, episode
@@ -129,16 +153,27 @@ class AgentWorkflowEngine:
         finally:
             await self.workflow_queue.put(workflow)
 
-    async def execute_tasks(self, tasks: list[dict], task_ids: list[str] | None = None, **kwargs) -> list[Episode]:
+    async def execute_tasks(
+        self,
+        tasks: list[dict],
+        task_ids: list[str] | None = None,
+        post_process_fn=None,
+        keep_in_memory: bool = True,
+        **kwargs,
+    ) -> list[Episode]:
         """Run asynchronous workflow execution with retry logic for multiple tasks.
 
         Args:
             tasks: List of task dictionaries to process.
             task_ids: Optional list of task identifiers. If None, UUIDs are generated.
+            post_process_fn: Optional callable(Episode) -> dict for serialization.
+                Only used when output_dir is set. Converts an episode to the dict
+                that gets written to disk.
+            keep_in_memory: If False, don't accumulate episodes in memory.
             **kwargs: Additional arguments passed to individual task processing.
 
         Returns:
-            list[Episode]: List of completed episodes from all tasks.
+            list[Episode]: List of completed episodes (empty if keep_in_memory=False).
         """
         if self.workflow_queue is None:
             await self.initialize_pool()
@@ -150,6 +185,7 @@ class AgentWorkflowEngine:
 
         futures = []
         idx_counter = 0
+        skipped = 0
         for task, task_id in zip(tasks, task_ids, strict=True):
             state = task_states[task_id]
             if state["idx"] is None:  # First time seeing this task_id
@@ -157,17 +193,38 @@ class AgentWorkflowEngine:
                 state["task"] = task
                 idx_counter += 1
             rollout_idx = state["total_rollouts"]
-            futures.append(self.process_task_with_retry(task, task_id, rollout_idx, **kwargs))
             state["total_rollouts"] += 1
+            if self.output_dir is not None and (self.output_dir / f"{task_id}:{rollout_idx}.json").exists():
+                skipped += 1
+                continue
+            futures.append(self.process_task_with_retry(task, task_id, rollout_idx, **kwargs))
 
-        with tqdm(total=len(tasks), desc="Generating trajectories") as pbar:
+        if skipped:
+            logger.info(f"Skipped {skipped} tasks with existing output files")
+
+        with tqdm(total=len(futures), desc="Generating trajectories") as pbar:
             for future in asyncio.as_completed(futures):
                 task_id, rollout_idx, episode = await future
 
-                state = task_states[task_id]
-                state["episodes"].append(episode)
-                state["completed"] += 1
+                if self.output_dir is not None:
+                    try:
+                        self.output_dir.mkdir(parents=True, exist_ok=True)
+                        serialize = post_process_fn or (lambda ep: ep.to_dict())
+                        episode_data = serialize(episode)
+                        episode_path = self.output_dir / f"{task_id}:{rollout_idx}.json"
+                        with open(episode_path, "w") as f:
+                            json.dump(episode_data, f, ensure_ascii=False)
+                    except Exception as e:
+                        logger.warning(f"Failed to save episode {task_id}:{rollout_idx}: {e}")
+
+                if keep_in_memory:
+                    task_states[task_id]["episodes"].append(episode)
+
+                task_states[task_id]["completed"] += 1
                 pbar.update(1)
+
+        if not keep_in_memory:
+            return []
 
         results = []
         sorted_tasks = sorted(task_states.keys(), key=lambda task_id: task_states[task_id]["idx"])
@@ -187,7 +244,7 @@ class AgentWorkflowEngine:
 
         return results
 
-    async def execute_tasks_verl(self, batch: "DataProto", **kwargs) -> "DataProto":
+    async def execute_tasks_verl(self, batch: DataProto, **kwargs) -> DataProto:
         """Execute tasks from a Verl DataProto batch and return results.
 
         Args:
@@ -215,8 +272,8 @@ class AgentWorkflowEngine:
         self.current_mode = "train"
         return self.transform_results_for_verl(results, task_ids)
 
-    def transform_results_for_verl(self, episodes: list[Episode], task_ids: np.ndarray) -> "DataProto":
-        """Transform episode results into Verl-compatible DataProto format.
+    def transform_results_for_verl(self, episodes: list[Episode], task_ids: np.ndarray) -> DataProto:
+        """Transform episode results into Verl-compatible DataProto format. Delegate to `transform_episodes_to_dataproto` in `rllm.experimental.verl.transform`.
 
         Args:
             episodes: List of completed episodes from workflow execution.
@@ -225,288 +282,37 @@ class AgentWorkflowEngine:
         Returns:
             DataProto: Formatted data ready for Verl training pipeline.
         """
-        # Local import to keep verl optional
-        from verl import DataProto
-        from verl.utils.torch_functional import pad_sequence_to_length
+        from rllm.experimental.verl.transform import transform_episodes_to_dataproto
 
-        prompts = []
-        responses = []
-        traj_rewards = []
-        step_rewards = []
-        episode_ids = []
-        trajectory_ids = []
-        step_ids = []
-        step_nums = []
-        repeat_counts = []
-        is_last_step = []
-        is_correct = []
-        traj_mask = []
-        termination_reasons = []
-        metrics = []
-        multi_modal_inputs_list = []
-        chat_completions_list = []
-        rollout_log_probs_list = []
+        dropped_episodes: list[dict] = []
+        remaining_episodes: list[Episode] = []
 
         for i, episode in enumerate(episodes):
-            total_steps = 0
-
             if episode is None:
                 print(f"Episode {i} is None (failed task), dropping it from the batch")
-                repeat_counts.append(0)
-                continue
-
-            if all(len(trajectory.steps) == 0 for trajectory in episode.trajectories):
-                # termination hits before an agent finishes it's first step
+                dropped_episodes.append(
+                    {
+                        "task_id": task_ids[i],
+                        "episode_id": None,
+                        "termination_reason": "unknown",
+                    }
+                )
+            elif all(len(trajectory.steps) == 0 for trajectory in episode.trajectories):
+                # Termination hits before an agent finishes its first step.
                 # (e.g., the initial prompt exceeds max_prompt_length or a timeout occurs)
-                # we delete the episode from the batch by setting repeat_counts to 0
+                # We delete the episode from the batch by setting repeat_counts to 0.
                 print(f"Episode {episode.id} has no valid trajectories, dropping it from the batch")
-                repeat_counts.append(0)
-                continue
-
-            for trajectory in episode.trajectories:
-                name = trajectory.name
-                trajectory_id = f"{task_ids[i]}_{name}"  # unique trajectory identifier e.g., 1234567890_solver
-
-                if len(trajectory.steps) == 0:
-                    logger.info(f"Trajectory {trajectory_id} has no steps, skipping")
-                    continue
-
-                if not self.config.rllm.stepwise_advantage.enable:
-                    if len(trajectory.steps) > 1:
-                        if not trajectory.is_cumulative():
-                            logger.warning(f"Warning: Multi-step trajectory {trajectory_id} is not cumulative, but stepwise mode is not enabled. There could be a token mismatch during trajectory generation.")
-
-                        chat_completions = trajectory.steps[-1].chat_completions
-                        chat_completions_list.append(chat_completions)
-                        prompt, response, mask = self.rollout_engine.chat_parser.tokenize_and_mask_cumulative(chat_completions)
-                        prompts.append(prompt)
-                        responses.append(response)
-                        traj_mask.append(mask)
-                        multi_modal_inputs_list.append({})  # empty dict
-
-                    elif isinstance(trajectory.steps[0].model_output, ModelOutput):
-                        step = trajectory.steps[0]
-                        # For ModelOutput, use chat_completions if available, otherwise None
-                        chat_completions_list.append(step.chat_completions if hasattr(step, "chat_completions") and step.chat_completions else None)
-
-                        prompt_ids = torch.tensor(step.model_output.prompt_ids, dtype=torch.long)
-                        prompts.append(prompt_ids)
-
-                        response_ids = torch.tensor(step.model_output.completion_ids, dtype=torch.long)
-                        responses.append(response_ids)
-
-                        mask = torch.ones_like(response_ids, dtype=torch.long)
-                        traj_mask.append(mask)
-                        multi_modal_inputs_list.append(step.model_output.multi_modal_inputs or {})
-
-                        logprobs = torch.tensor(step.model_output.logprobs, dtype=torch.float32)
-                        rollout_log_probs_list.append(logprobs)
-
-                    else:
-                        chat_completions = trajectory.steps[0].chat_completions
-                        chat_completions_list.append(chat_completions)
-                        prompt, response, mask = self.rollout_engine.chat_parser.tokenize_and_mask(chat_completions)
-                        prompts.append(prompt)
-                        responses.append(response)
-                        traj_mask.append(mask)
-                        multi_modal_inputs_list.append({})  # empty dict
-
-                    step_rewards.append(trajectory.reward)
-                    step_ids.append(trajectory_id)
-                    n_steps = 1
-
-                else:
-                    for step_idx, step in enumerate(trajectory.steps):
-                        if isinstance(step.model_output, ModelOutput):
-                            # For ModelOutput, use chat_completions if available, otherwise None
-                            chat_completions_list.append(step.chat_completions if hasattr(step, "chat_completions") and step.chat_completions else None)
-                            prompt_ids = torch.tensor(step.model_output.prompt_ids, dtype=torch.long)
-                            prompts.append(prompt_ids)
-
-                            response_ids = torch.tensor(step.model_output.completion_ids, dtype=torch.long)
-                            responses.append(response_ids)
-
-                            mask = torch.ones_like(response_ids, dtype=torch.long)
-                            traj_mask.append(mask)
-                            multi_modal_inputs_list.append(step.model_output.multi_modal_inputs or {})
-
-                            logprobs = torch.tensor(step.model_output.logprobs, dtype=torch.float32)
-                            rollout_log_probs_list.append(logprobs)
-
-                        else:
-                            chat_completions = step.chat_completions
-                            chat_completions_list.append(chat_completions)
-                            prompt, response, mask = self.rollout_engine.chat_parser.tokenize_and_mask(chat_completions)
-                            prompts.append(prompt)
-                            responses.append(response)
-                            traj_mask.append(mask)
-                            multi_modal_inputs_list.append({})  # empty dict
-
-                        step_rewards.append(step.reward)
-                        step_ids.append(f"{trajectory_id}_step{step_idx}")  # unique step identifier e.g., 1234567890_solver_step0
-
-                    n_steps = len(trajectory.steps)
-
-                trajectory_ids.extend([trajectory_id] * n_steps)
-                step_nums.extend([n_steps] * n_steps)
-                traj_rewards.extend([trajectory.reward] * n_steps)
-                is_last_step.extend([False] * n_steps)
-                is_last_step[-1] = True
-                total_steps += n_steps
-
-            episode_ids.extend([episode.id] * total_steps)
-            is_correct.extend([episode.is_correct] * total_steps)
-            termination_reasons.extend([episode.termination_reason if episode.termination_reason is not None else TerminationReason.UNKNOWN] * total_steps)
-            metrics.extend([episode.metrics] * total_steps)
-            repeat_counts.append(total_steps)
-
-        prompts_batch = torch.nn.utils.rnn.pad_sequence(
-            [torch.flip(i, dims=[0]) for i in prompts],
-            batch_first=True,
-            padding_value=self.rollout_engine.tokenizer.pad_token_id,
-        ).flip(dims=[1])
-        max_prompt_length = self.config.data.max_prompt_length
-        prompts_batch = pad_sequence_to_length(prompts_batch, max_prompt_length, self.rollout_engine.tokenizer.pad_token_id, left_pad=True)
-        prompts_batch = prompts_batch[:, -max_prompt_length:]  # truncate if necessary
-
-        response_batch = torch.nn.utils.rnn.pad_sequence(
-            responses,
-            batch_first=True,
-            padding_value=self.rollout_engine.tokenizer.pad_token_id,
-        )
-        max_response_length = self.config.data.max_response_length
-        response_batch = pad_sequence_to_length(response_batch, max_response_length, self.rollout_engine.tokenizer.pad_token_id, left_pad=False)
-        response_batch = response_batch[:, :max_response_length]  # truncate if necessary
-
-        input_ids = torch.concat([prompts_batch, response_batch], dim=1)
-
-        prompt_lengths = torch.as_tensor([len(t) for t in prompts]).clamp_(min=0, max=max_prompt_length)
-        prompt_pos = torch.arange(max_prompt_length).unsqueeze(0)
-        prompt_mask = prompt_pos >= (max_prompt_length - prompt_lengths.unsqueeze(1))
-
-        response_lengths = torch.as_tensor([len(t) for t in responses]).clamp_(min=0, max=max_response_length)
-        resp_pos = torch.arange(max_response_length).unsqueeze(0)
-        response_mask = resp_pos < response_lengths.unsqueeze(1)
-
-        attention_mask = torch.cat([prompt_mask, response_mask], dim=1).long()
-
-        if hasattr(self.rollout_engine, "processor") and self.rollout_engine.processor is not None:
-            position_ids = self._handle_multimodal_position_ids(
-                processor=self.rollout_engine.processor,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                multi_modal_inputs=multi_modal_inputs_list,
-            )
-        else:
-            position_ids = (torch.cumsum(attention_mask, dim=1) - 1) * attention_mask
-
-        traj_mask = torch.nn.utils.rnn.pad_sequence(traj_mask, batch_first=True, padding_value=0)
-        traj_mask = pad_sequence_to_length(traj_mask, max_response_length, 0, left_pad=False)
-        traj_mask = traj_mask[:, :max_response_length]  # truncate if necessary
-
-        # Place all rewards to last response token of the last_step response
-        traj_rewards_batch = torch.zeros_like(response_batch, dtype=torch.float32)
-        step_rewards_batch = torch.zeros_like(response_batch, dtype=torch.float32)
-
-        for i, (traj_reward, step_reward) in enumerate(zip(traj_rewards, step_rewards, strict=False)):
-            resp_len = response_lengths[i]
-            if resp_len > 0 and resp_len <= traj_rewards_batch.shape[1]:
-                traj_rewards_batch[i, resp_len - 1] = traj_reward
-                step_rewards_batch[i, resp_len - 1] = step_reward
-
-        rollout_log_probs_batch = None
-        if rollout_log_probs_list:
-            rollout_log_probs_batch = torch.nn.utils.rnn.pad_sequence(
-                rollout_log_probs_list,
-                batch_first=True,
-                padding_value=0.0,
-            )
-            rollout_log_probs_batch = pad_sequence_to_length(rollout_log_probs_batch, max_response_length, 0.0, left_pad=False)
-            rollout_log_probs_batch = rollout_log_probs_batch[:, :max_response_length]
-
-        # compact filtering
-        cf = self.config.rllm.compact_filtering
-        is_valid = [True] * len(episode_ids)
-        if cf.enable:
-            for i in range(len(episode_ids)):
-                termination_reason = termination_reasons[i]
-                if (cf.mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED) or (cf.mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED) or (cf.mask_env_done and termination_reason == TerminationReason.ENV_DONE) or (cf.mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED) or (cf.mask_timeout and termination_reason == TerminationReason.TIMEOUT) or (cf.mask_unknown and termination_reason == TerminationReason.UNKNOWN) or (cf.mask_error and termination_reason == TerminationReason.ERROR):
-                    is_valid[i] = False  # set flag to filter out the episode later (after advantages are computed)
-
-        non_tensors = {
-            "episode_ids": np.array(episode_ids),  # unique identifier for each rollout
-            "trajectory_ids": np.array(trajectory_ids),  # unique identifier for each trajectory (shares prefix with task_id) and shared across rollouts
-            "step_ids": np.array(step_ids),  # unique identifier for each step (shares prefix with task_id) and shared across rollouts
-            "batch_ids": np.array([str(uuid.uuid4())] * len(episode_ids)),  # unique identifier for each batch
-            "step_nums": np.array(step_nums),
-            "is_correct": np.array(is_correct),
-            "termination_reasons": np.array([x.value for x in termination_reasons]),
-            "metrics": np.array(metrics),
-            "is_valid": np.array(is_valid),
-            "is_last_step": np.array(is_last_step),
-            "is_pad_step": np.array([False] * len(episode_ids)),
-            "chat_completions": np.array(chat_completions_list, dtype=object),  # chat completions for distillation
-        }
-
-        if any(mm_inputs is not None for mm_inputs in multi_modal_inputs_list):
-            non_tensors["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
-
-        tensors = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "prompts": prompts_batch,
-            "responses": response_batch,
-            "response_mask": traj_mask,
-            "traj_rewards": traj_rewards_batch,
-            "step_rewards": step_rewards_batch,
-        }
-
-        if rollout_log_probs_batch is not None:
-            tensors["rollout_log_probs"] = rollout_log_probs_batch
-
-        return DataProto.from_dict(
-            tensors=tensors,
-            non_tensors=non_tensors,
-            meta_info={
-                "repeat_counts": repeat_counts,
-            },
-        )
-
-    def _handle_multimodal_position_ids(self, processor, input_ids: torch.Tensor, attention_mask: torch.Tensor, multi_modal_inputs: list[dict]) -> torch.Tensor:
-        """Handle multimodal position ids calculation. Borrowed from verl.utils.dataset.rl_dataset.py"""
-        batch_size = input_ids.shape[0]
-        position_ids_list = []
-
-        if processor is not None and "Qwen2VLImageProcessor" in processor.image_processor.__class__.__name__:
-            # qwen-vl mrope
-            if "Qwen3VLProcessor" in processor.__class__.__name__:
-                from verl.models.transformers.qwen3_vl import get_rope_index
+                dropped_episodes.append(
+                    {
+                        "task_id": task_ids[i],
+                        "episode_id": episode.id,
+                        "termination_reason": episode.termination_reason.value if episode.termination_reason is not None else "unknown",
+                    }
+                )
             else:
-                from verl.models.transformers.qwen2_vl import get_rope_index
+                remaining_episodes.append(episode)
 
-            for i in range(batch_size):
-                model_inputs = multi_modal_inputs[i] if i < len(multi_modal_inputs) else {}
-                vision_position_ids = get_rope_index(
-                    processor,
-                    input_ids=input_ids[i],
-                    image_grid_thw=model_inputs.get("image_grid_thw"),
-                    video_grid_thw=model_inputs.get("video_grid_thw"),
-                    second_per_grid_ts=model_inputs.get("second_per_grid_ts"),
-                    attention_mask=attention_mask[i],
-                )  # (3, seq_length)
-                valid_mask = attention_mask[i].bool()
-                text_position_ids = torch.ones((1, len(input_ids[i])), dtype=torch.long)
-                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
-                position_ids_list.append(torch.cat((text_position_ids, vision_position_ids), dim=0))  # (4, seq_length)
-
-        else:
-            # Fallback: should not reach here if called correctly
-            raise ValueError(f"Unsupported processor type: {processor.__class__.__name__ if processor else None}")
-
-        # Stack all position_ids to form batch: (batch_size, 4, seq_length)
-        position_ids = torch.stack(position_ids_list, dim=0)
-        return position_ids
+        return transform_episodes_to_dataproto(remaining_episodes, self.rollout_engine, self.config.data.max_prompt_length, self.config.data.max_response_length)
 
     def shutdown(self):
         """Shutdown the workflow engine and cleanup resources."""

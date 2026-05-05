@@ -5,7 +5,10 @@ import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-import torch
+try:
+    import torch
+except ImportError as err:
+    raise ImportError("AgentExecutionEngine requires extra dependencies. Install with: pip install rllm[train]") from err
 
 from rllm.agents.agent import Action, BaseAgent, Trajectory
 from rllm.agents.utils import (
@@ -103,6 +106,7 @@ class AgentExecutionEngine:
                 **rollout_engine_args,
                 api_retries=api_retries,
                 tokenizer=self.tokenizer,
+                chat_parser=self.chat_parser,
                 max_prompt_length=self.max_prompt_length,
                 max_response_length=self.max_response_length,
                 disable_thinking=self.disable_thinking,
@@ -267,7 +271,12 @@ class AgentExecutionEngine:
             except asyncio.TimeoutError:
                 termination_reason = "ENV_TIMEOUT"
                 if step_idx == 0:
-                    colorful_print(f"Warning: Trajectory {idx} completed due to: {termination_reason} before able to perform 1 complete action. This might cause unexpected behavior. Consider increasing trajectory timeout limit.\n", "red")
+                    colorful_print(
+                        f"Warning: Trajectory {idx} completed due to: {termination_reason}"
+                        " before able to perform 1 complete action. This might cause"
+                        " unexpected behavior. Consider increasing trajectory timeout limit.\n",
+                        "red",
+                    )
                 reward = 0
 
                 cur_step = agent.get_current_state()
@@ -303,9 +312,21 @@ class AgentExecutionEngine:
             assistant_msg_tokens, assistant_msg_masks = [], []
             env_msg_tokens, env_msg_masks = [], []
             if assistant_message:
-                assistant_msg_tokens, assistant_msg_masks = convert_messages_to_tokens_and_masks([assistant_message], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=False)
+                assistant_msg_tokens, assistant_msg_masks = convert_messages_to_tokens_and_masks(
+                    [assistant_message],
+                    tokenizer=self.tokenizer,
+                    parser=self.chat_parser,
+                    contains_first_msg=False,
+                    contains_generation_msg=False,
+                )
             if env_messages:
-                env_msg_tokens, env_msg_masks = convert_messages_to_tokens_and_masks(env_messages, tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=True)
+                env_msg_tokens, env_msg_masks = convert_messages_to_tokens_and_masks(
+                    env_messages,
+                    tokenizer=self.tokenizer,
+                    parser=self.chat_parser,
+                    contains_first_msg=False,
+                    contains_generation_msg=True,
+                )
 
             # Update repsonse token length
             response_token_len += len(assistant_msg_tokens) + len(env_msg_tokens)
@@ -469,7 +490,12 @@ class AgentExecutionEngine:
                             break
 
                     if diff_pos is not None:
-                        logger.warning(f"When assemble steps, detect the trajectory not accumulative at position {diff_pos}. Expected: {accumulated_sequence[diff_pos : diff_pos + 5]}, Got: {prefix[diff_pos : diff_pos + 5]}. Setting response_masks to all 0s. This is likely due to retokenization.")
+                        logger.warning(
+                            f"When assemble steps, detect the trajectory not accumulative at position {diff_pos}. "
+                            f"Expected: {accumulated_sequence[diff_pos : diff_pos + 5]}, "
+                            f"Got: {prefix[diff_pos : diff_pos + 5]}. "
+                            "Setting response_masks to all 0s. This is likely due to retokenization."
+                        )
                     else:
                         logger.warning(f"When assemble steps, detect length mismatch. Expected length: {len(accumulated_sequence)}, Got length: {len(prefix)}. Setting response_masks to all 0s.")
 

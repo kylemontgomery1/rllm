@@ -11,6 +11,7 @@ import numpy as np
 from rllm.agents.agent import BaseAgent, Episode, Trajectory
 from rllm.engine.rollout.rollout_engine import RolloutEngine
 from rllm.environments.base.base_env import BaseEnv
+from rllm.workflows.store import Store
 
 
 class TerminationReason(Enum):
@@ -21,6 +22,7 @@ class TerminationReason(Enum):
     TIMEOUT = "timeout"
     UNKNOWN = "unknown"
     ERROR = "error"
+    FORMAT_ERROR = "format_error"
 
 
 class TerminationEvent(Exception):
@@ -30,7 +32,16 @@ class TerminationEvent(Exception):
 
 
 class Workflow(ABC):
-    def __init__(self, rollout_engine: RolloutEngine, executor: ThreadPoolExecutor, timeout=1e6, gamma=0.0, reward_bonus_coeff=0.0, **kwargs):
+    def __init__(
+        self,
+        rollout_engine: RolloutEngine,
+        executor: ThreadPoolExecutor,
+        timeout=1e6,
+        gamma=0.0,
+        reward_bonus_coeff=0.0,
+        store: Store | None = None,
+        **kwargs,
+    ):
         """Initialize the Workflow.
 
         Args:
@@ -39,6 +50,8 @@ class Workflow(ABC):
             timeout: The timeout for the workflow.
             gamma: The discount factor for the workflow.
             reward_bonus_coeff: The reward bonus coefficient for the workflow.
+            store: Optional cross-episode store shared across all workflow
+                instances.  See :class:`rllm.workflows.store.Store`.
             **kwargs: Additional keyword arguments.
         """
         self.rollout_engine = rollout_engine
@@ -46,6 +59,7 @@ class Workflow(ABC):
         self.timeout = int(timeout)
         self.gamma = gamma
         self.reward_bonus_coeff = reward_bonus_coeff
+        self.store = store
 
         self._completed_trajectories: list[Trajectory] = []
 
@@ -71,9 +85,12 @@ class Workflow(ABC):
             uid: The unique identifier for the task.
             **kwargs: Additional keyword arguments.
         """
+        # Extract timeout from kwargs, default to self.timeout
+        timeout = kwargs.pop("timeout", self.timeout)
+
         try:
             coro = self.run(task, uid, **kwargs)
-            output = await asyncio.wait_for(coro, timeout=self.timeout)
+            output = await asyncio.wait_for(coro, timeout=timeout)
             if output is not None and isinstance(output, Episode):
                 return output  # we assume it's already postprocessed
             return self.postprocess_episode(self.collect_trajectories(), TerminationReason.UNKNOWN)
@@ -128,7 +145,12 @@ class Workflow(ABC):
             if attr_name.startswith("_"):
                 continue
             attr_value = getattr(self, attr_name)
-            if isinstance(attr_value, BaseAgent) and hasattr(attr_value, "trajectory") and getattr(attr_value.trajectory, "uid", None) not in completed_trajectory_uids and len(attr_value.trajectory.steps) > 0:
+            if (
+                isinstance(attr_value, BaseAgent)
+                and hasattr(attr_value, "trajectory")
+                and getattr(attr_value.trajectory, "uid", None) not in completed_trajectory_uids
+                and len(attr_value.trajectory.steps) > 0
+            ):
                 episode.trajectories.append(deepcopy(attr_value.trajectory))
 
         return episode
@@ -176,7 +198,7 @@ class Workflow(ABC):
         """
         total_reward = 0
         for trajectory in episode.trajectories:
-            total_reward += trajectory.reward
+            total_reward += trajectory.reward or 0
         episode.is_correct = total_reward > 0
 
     def collect_metrics(self, episode: Episode) -> None:
@@ -189,7 +211,7 @@ class Workflow(ABC):
         metrics = defaultdict(list)
         for traj in episode.trajectories:
             name = traj.name
-            metrics[name].append(traj.reward)
+            metrics[name].append(traj.reward or 0.0)
         episode.metrics = {f"{k}_acc": float(np.mean(v)) for k, v in metrics.items()}
 
     def postprocess_episode(self, episode: Episode, termination_reason: TerminationReason = None, error: dict = None) -> Episode:

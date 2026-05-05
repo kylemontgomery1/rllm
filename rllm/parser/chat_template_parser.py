@@ -1,15 +1,25 @@
+import datetime
 import json
+import json5
 import logging
 import re
+import os
 from copy import deepcopy
-
-import torch
 
 from rllm.tools.tool_base import Tool, ToolCall, ToolOutput
 
 from .utils import PARSER_TEST_MESSAGES
 
 logger = logging.getLogger(__name__)
+
+
+def _import_torch():
+    try:
+        import torch
+
+        return torch
+    except ImportError as err:
+        raise ImportError("ChatTemplateParser.tokenize_and_mask requires PyTorch. Install with: pip install rllm[train]") from err
 
 
 class ChatTemplateParser:
@@ -19,7 +29,10 @@ class ChatTemplateParser:
         self.generation_prompt = self._get_generation_prompt(tokenizer)
 
     def _get_generation_prompt(self, tokenizer):
-        messages = [{"role": "assistant", "content": ""}]
+        # Some chat templates (e.g. Qwen3.5) reject a lone assistant message,
+        # so prepend a stub user message. It is present in both with_prompt
+        # and without_prompt and cancels out in the slice below.
+        messages = [{"role": "user", "content": ""}, {"role": "assistant", "content": ""}]
 
         with_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
         without_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
@@ -92,16 +105,19 @@ class ChatTemplateParser:
         if isinstance(tokenizer.name_or_path, str):
             model_name = tokenizer.name_or_path.lower()
             tokenizer_cls = tokenizer.__class__.__name__.lower()
-            logger.info(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
-            if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and "llama" in tokenizer_cls:
+            logger.debug(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
+            if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and ("llama" in tokenizer_cls or "distill-qwen" in model_name):
                 if "deepseek-math-v2" in model_name or "deepseek-v3.2-exp" in model_name:
                     logger.info(f"Using DeepSeekV32ExpChatTemplateParser for {tokenizer.name_or_path}")
                     return DeepSeekV32ExpChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
                 else:
                     logger.info(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
                     return DeepseekQwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
+            elif "tongyi-deepresearch" in model_name:
+                logger.info(f"Using TongyiDeepResearchChatTemplateParser for {tokenizer.name_or_path}")
+                return TongyiDeepResearchChatTemplateParser(tokenizer)
             elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
-                logger.info(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
+                logger.debug(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
                 return QwenChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
             elif "llama" in model_name:
                 logger.info(f"Using LlamaChatTemplateParser for {tokenizer.name_or_path}")
@@ -109,6 +125,9 @@ class ChatTemplateParser:
             elif "gpt-oss" in model_name or "imo" in model_name:
                 logger.info(f"Using HarmonyChatTemplateParser for {tokenizer.name_or_path}")
                 return HarmonyChatTemplateParser()
+            elif "kimi-k2" in model_name:
+                logger.info(f"Using KimiK2ThinkingChatTemplateParser for {tokenizer.name_or_path}")
+                return KimiK2ThinkingChatTemplateParser(tokenizer)
 
         # Default to the standard parser if no specific match
         parser = ChatTemplateParser(tokenizer, processor=processor)
@@ -130,6 +149,7 @@ class ChatTemplateParser:
         response_ids = self.tokenizer.encode(response, add_special_tokens=False)
         response_mask = [1] * len(response_ids)
 
+        torch = _import_torch()
         prompt_ids = torch.tensor(prompt_ids, dtype=torch.long)
         response_ids = torch.tensor(response_ids, dtype=torch.long)
         response_mask = torch.tensor(response_mask, dtype=torch.long)
@@ -162,6 +182,7 @@ class ChatTemplateParser:
                 response_ids.extend(ids)
                 response_mask.extend([0] * len(ids))
 
+        torch = _import_torch()
         prompt_ids = torch.tensor(prompt_ids, dtype=torch.long)
         response_ids = torch.tensor(response_ids, dtype=torch.long)
         response_mask = torch.tensor(response_mask, dtype=torch.long)
@@ -170,15 +191,19 @@ class ChatTemplateParser:
 
 
 class DeepseekQwenChatTemplateParser(ChatTemplateParser):
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, disable_thinking=False):
         super().__init__(tokenizer)
 
+        self.disable_thinking = disable_thinking
         self.bos_token = tokenizer.bos_token
         self.eos_token = tokenizer.eos_token
         self.system_token = ""
         self.user_token = "<｜User｜>"
         self.assistant_token = "<｜Assistant｜>"
-        self.generation_prompt = self.assistant_token + "<think>\n"
+        if disable_thinking:
+            self.generation_prompt = self.assistant_token + "</think>\n"
+        else:
+            self.generation_prompt = self.assistant_token + "<think>\n"
 
         from rllm.parser.tool_parser import R1ToolParser
 
@@ -368,6 +393,7 @@ class QwenChatTemplateParser(ChatTemplateParser):
         self.image_token = "<|image_pad|>"
         self.vision_start_token = "<|vision_start|>"
         self.vision_end_token = "<|vision_end|>"
+        self.stop_sequences = [151645]
 
         from rllm.parser.tool_parser import QwenToolParser
 
@@ -446,7 +472,7 @@ class QwenChatTemplateParser(ChatTemplateParser):
             result = self.assistant_token
             if reasoning and accumulate_reasoning:
                 result += "<think>\n" + reasoning
-                if content:
+                if content or tool_calls:
                     result += "\n</think>\n\n"
 
             if content:
@@ -506,35 +532,38 @@ class QwenChatTemplateParser(ChatTemplateParser):
 
             return self.user_token + tool_outputs_str + self.eot_token
 
+    def _strip_special_tokens(self, text):
+        if text.endswith(self.eos_token):
+            text = text[: -len(self.eos_token)]
+        if text.endswith(self.eot_token):
+            text = text[: -len(self.eot_token)]
+        return text.strip()
+
     def parse_completion(self, completion_ids):
         completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
-
         if completion_text.count("</think>") == 1:
             reasoning, _, content = completion_text.partition("</think>")
             if reasoning.startswith("<think>"):
                 reasoning = reasoning[len("<think>") :]
-            if content.endswith(self.eos_token):
-                content = content[: -len(self.eos_token)]
-            if content.endswith(self.eot_token):
-                content = content[: -len(self.eot_token)]
             reasoning = reasoning.strip()
-            content = content.strip()
+            content = self._strip_special_tokens(content)
         elif not self.disable_thinking:
-            # generation was cut short during reasoning
-            reasoning = completion_text
-            if reasoning.startswith("<think>"):
-                reasoning = reasoning[len("<think>") :]
-            reasoning = reasoning.strip()
-            content = ""
+            # Two cases where the model didn't output </think>:
+            # 1. Started <think> but no </think> -> thinking model, treat rest as reasoning, content=""
+            # 2. No <think> at all -> non-thinking model (e.g. instruct), treat full text as content
+            if "<think>" in completion_text:
+                reasoning = completion_text
+                if reasoning.startswith("<think>"):
+                    reasoning = reasoning[len("<think>") :]
+                reasoning = reasoning.strip()
+                content = ""
+            else:
+                reasoning = ""
+                content = self._strip_special_tokens(completion_text)
         else:
             # thinking is disabled, so everything is content
             reasoning = ""
-            content = completion_text
-            if content.endswith(self.eos_token):
-                content = content[: -len(self.eos_token)]
-            if content.endswith(self.eot_token):
-                content = content[: -len(self.eot_token)]
-            content = content.strip()
+            content = self._strip_special_tokens(completion_text)
 
         if content:
             # parse tool calls from content
@@ -627,6 +656,117 @@ class LlamaChatTemplateParser(ChatTemplateParser):
         raise NotImplementedError("LLamaChatTemplateParser does not support parse_completion")
 
 
+class TongyiDeepResearchChatTemplateParser(QwenChatTemplateParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        print("TongyiDeepResearchChatTemplateParser init")
+        from rllm.parser.tool_parser import TongyiDeepResearchToolParser
+
+        self.tool_parser = TongyiDeepResearchToolParser()
+
+    def parse_system(self, message, tools_prompt_str=""):
+        content = message["content"]
+        if "# Tools" not in content and tools_prompt_str:
+            content += tools_prompt_str
+        if "Current date:" not in content:
+            content += "\n\nCurrent date: " + datetime.date.today().strftime("%Y-%m-%d")
+        return self.system_token + content + self.eot_token
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = (message.get("content", None) or "").strip()
+        reasoning = (message.get("reasoning", None) or "").strip()
+        tool_calls = message.get("tool_calls", None) or []
+
+        if not reasoning and not tool_calls:
+            return self.assistant_token + content + self.eot_token
+
+        else:
+            result = self.assistant_token
+
+            if reasoning and accumulate_reasoning:
+                result += "<think>\n" + reasoning
+                if content or tool_calls:
+                    result += "\n</think>\n\n"
+
+            if content:
+                result += content
+
+            elif tool_calls:
+                try:
+                    tool_calls_strs = []
+                    for tool_call in tool_calls:
+                        if isinstance(tool_call, ToolCall):
+                            tool_call_dict = tool_call.to_dict()
+                        elif isinstance(tool_call, dict) and "function" in tool_call:
+                            tool_call_dict = tool_call["function"]
+                        else:
+                            tool_call_dict = tool_call
+                        arguments_obj = tool_call_dict.get("arguments")
+                        if isinstance(arguments_obj, str):
+                            try:
+                                arguments_obj = json.loads(arguments_obj)
+                            except json.JSONDecodeError:
+                                pass
+
+                        tool_name = tool_call_dict.get("name", "")
+
+                        # Special handling for PythonInterpreter
+                        if tool_name == "PythonInterpreter" and isinstance(arguments_obj, dict) and "code" in arguments_obj:
+                            code = arguments_obj["code"]
+                            tool_call_for_dump = {"name": tool_name, "arguments": {}}
+                            tool_call_str = f"{self.tool_parser.tool_call_begin}\n{json.dumps(tool_call_for_dump)}\n<code>\n{code}\n</code>\n{self.tool_parser.tool_call_end}"
+                        else:
+                            tool_call_for_dump = dict(tool_call_dict)
+                            if arguments_obj is not None:
+                                tool_call_for_dump["arguments"] = arguments_obj
+                            tool_call_str = f"{self.tool_parser.tool_call_begin}\n{json.dumps(tool_call_for_dump)}\n{self.tool_parser.tool_call_end}"
+
+                        tool_calls_strs.append(tool_call_str)
+                    tool_calls_str = "\n".join(tool_calls_strs)
+                except Exception as e:
+                    logger.error(f"Failed to format tool calls: {e}")
+                    tool_calls_str = ""
+
+                result += tool_calls_str
+
+            result += self.eot_token
+            return result
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        if completion_text.count("</think>") == 1:
+            reasoning, _, content = completion_text.partition("</think>")
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            reasoning = reasoning.strip()
+            content = content.strip()
+        else:
+            # generation was cut short during reasoning
+            reasoning = completion_text
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            reasoning = reasoning.strip()
+            content = ""
+
+        # Parse tool calls from content
+        tool_calls = self.tool_parser.parse(content) if content else []
+
+        # For Tongyi, we assume either tool calls OR content, not both
+        if tool_calls:
+            content = ""
+
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+        }
+
+
 class HarmonyChatTemplateParser(ChatTemplateParser):
     def __init__(self, tokenizer=None):
         from openai_harmony import (
@@ -642,43 +782,93 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
         return self.parse_prompt_from_messages(messages, add_generation_prompt=add_generation_prompt, is_first_msg=is_first_msg, **kwargs)
 
     def parse_prompt_from_messages(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs):
-        from openai_harmony import Conversation, DeveloperContent, Message, ReasoningEffort, RenderConversationConfig, Role, SystemContent
-
-        # messages is a list[dict], where each dict is of the following structure:
-        # {
-        #     "role": str,
-        #     "content": str,
-        #     "reasoning": str, # optional
-        # }
+        from openai_harmony import Author, Conversation, DeveloperContent, Message, ReasoningEffort, RenderConversationConfig, Role, SystemContent, ToolDescription
 
         messages = deepcopy(messages)
         harmony_messages: list[Message] = []
 
-        if is_first_msg:
-            # 1. system prompt
-            reasoning_effort = ReasoningEffort(kwargs.get("reasoning_effort", "medium").capitalize())
-            system_message = SystemContent.new().with_reasoning_effort(reasoning_effort)
-            harmony_messages.append(Message.from_role_and_content(Role.SYSTEM, system_message))
+        # Extract tool config from kwargs - separate built-in tools from function tools
+        tools = list(kwargs.get("tools", []))
+        builtin_tools = [t for t in tools if t.name.startswith(("browser", "python"))]
+        function_tools = [t for t in tools if not t.name.startswith(("browser", "python"))]
 
-            # 2. developer prompt
-            if messages[0]["role"] == "system":
+        if is_first_msg:
+            # 1. system prompt (with built-in tools)
+            reasoning_effort = ReasoningEffort(kwargs.get("reasoning_effort", "medium").capitalize())
+            system_content = SystemContent.new().with_reasoning_effort(reasoning_effort).with_conversation_start_date(datetime.date.today().strftime("%Y-%m-%d"))
+            for t in builtin_tools:
+                if t.name.startswith("browser"):
+                    system_content = system_content.with_browser_tool()
+                elif t.name.startswith("python"):
+                    if hasattr(t, "tool_config"):
+                        system_content = system_content.with_tools(t.tool_config)
+                    else:
+                        system_content = system_content.with_python_tool()
+            harmony_messages.append(Message.from_role_and_content(Role.SYSTEM, system_content))
+
+            # 2. developer prompt (with function tools)
+            instructions = None
+            if messages and messages[0]["role"] == "system":
                 instructions = messages.pop(0).get("content")
-                developer_message = DeveloperContent.new().with_instructions(instructions)
-                harmony_messages.append(Message.from_role_and_content(Role.DEVELOPER, developer_message))
+
+            developer_content = DeveloperContent.new()
+            if instructions:
+                developer_content = developer_content.with_instructions(instructions)
+            if function_tools:
+                tool_descriptions = [
+                    ToolDescription(
+                        name=t.json["function"]["name"],
+                        description=t.json["function"].get("description", ""),
+                        parameters=t.json["function"].get("parameters"),
+                    )
+                    for t in function_tools
+                ]
+                developer_content = developer_content.with_function_tools(tool_descriptions)
+
+            if instructions or function_tools:
+                harmony_messages.append(Message.from_role_and_content(Role.DEVELOPER, developer_content))
 
         # 3. the rest of the messages
         for message in messages:
             if message["role"] == "user":
                 harmony_messages.append(Message.from_role_and_content(Role.USER, message["content"]))
             elif message["role"] == "assistant":
-                reasoning = message.get("reasoning", None)
-                content = message.get("content", None)
+                reasoning = message.get("reasoning")
+                content = message.get("content")
+                tool_calls = message.get("tool_calls", [])
                 if reasoning:
                     harmony_messages.append(Message.from_role_and_content(Role.ASSISTANT, reasoning).with_channel("analysis"))
+                for tc in tool_calls:
+                    name = tc.name if hasattr(tc, "name") else tc["name"]
+                    args = tc.arguments if hasattr(tc, "arguments") else tc["arguments"]
+                    if name.startswith("python") and isinstance(args, dict) and "code" in args:
+                        dumped_args = args["code"]
+                    elif not args and tc.metadata and "raw_arguments" in tc.metadata:
+                        dumped_args = tc.metadata["raw_arguments"]
+                    else:
+                        dumped_args = json.dumps(args)
+                    is_builtin = name.startswith(("browser", "python"))
+                    channel = "analysis" if is_builtin else "commentary"
+                    content_type = "code" if is_builtin else "json"
+                    harmony_messages.append(
+                        Message.from_role_and_content(Role.ASSISTANT, dumped_args)
+                        .with_channel(channel)
+                        .with_recipient(name)
+                        .with_content_type(content_type)
+                    )
                 if content:
                     harmony_messages.append(Message.from_role_and_content(Role.ASSISTANT, content).with_channel("final"))
             elif message["role"] == "tool":
-                raise NotImplementedError("Tool messages are not supported yet")
+                tool_outputs = message.get("tool_outputs", [])
+                for tool_output in tool_outputs:
+                    name = tool_output.name
+                    is_builtin = name.startswith(("browser", "python"))
+                    channel = "analysis" if is_builtin else "commentary"
+                    harmony_messages.append(
+                        Message.from_author_and_content(Author.new(Role.TOOL, name), str(tool_output))
+                        .with_channel(channel)
+                        .with_recipient("assistant")
+                    )
             else:
                 raise NotImplementedError(f"Unsupported message role: {message['role']}")
 
@@ -704,24 +894,37 @@ class HarmonyChatTemplateParser(ChatTemplateParser):
         # NOTE: harmony will throw an error if the sequence ends during the header (e.g., due to length)
         harmony_messages = self.enc.parse_messages_from_completion_tokens(completion_ids, role=Role.ASSISTANT)
 
-        analysis = ""
-        final = ""
+        reasoning = ""
+        content = ""
+        tool_calls = []
+
         for message in harmony_messages:
-            content = message.content[0].text
+            text = message.content[0].text
             channel = message.channel
+            recipient = message.recipient
 
-            if channel == "analysis":
-                analysis += content
+            if recipient:
+                VALID_CHANNELS = {"analysis", "final", "commentary"}
+                if channel and channel not in VALID_CHANNELS:
+                    recipient = channel
+                    is_builtin = recipient.startswith(("browser", "python"))
+                    channel = "analysis" if is_builtin else "commentary"
+                if recipient.startswith("python"):
+                    tool_calls.append(ToolCall(name=recipient, arguments={"code": text}))
+                else:
+                    try:
+                        arguments = json5.loads(text) if text.strip() else {}
+                        if not isinstance(arguments, dict):
+                            raise ValueError(f"parsed arguments is {type(arguments).__name__}, not dict")
+                        tool_calls.append(ToolCall(name=recipient, arguments=arguments))
+                    except Exception:
+                        tool_calls.append(ToolCall(name=recipient, arguments={}, metadata={"raw_arguments": text}))
+            elif channel == "analysis":
+                reasoning += text
             elif channel == "final":
-                final += content
+                content += text
 
-        # TODO: handle tool calls
-
-        return {
-            "content": final,
-            "reasoning": analysis,
-            "tool_calls": [],
-        }
+        return {"content": content, "reasoning": reasoning, "tool_calls": tool_calls}
 
 
 class DeepSeekV32ExpChatTemplateParser(ChatTemplateParser):
@@ -809,6 +1012,352 @@ class DeepSeekV32ExpChatTemplateParser(ChatTemplateParser):
             content = content.strip()
 
         # TODO: handle tool calls
+
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": [],
+        }
+
+
+class DeepResearchVChatTemplateParser:
+    def __init__(self, tokenizer, processor=None, disable_thinking=False, image_folder_path="./pageshots", resize_width=None):
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.disable_thinking = disable_thinking
+
+        self.bos_token = tokenizer.bos_token
+        self.eos_token = tokenizer.eos_token
+        self.eot_token = "<|im_end|>\n"
+        self.system_token = "<|im_start|>system\n"
+        self.user_token = "<|im_start|>user\n"
+        self.assistant_token = "<|im_start|>assistant\n"
+        if disable_thinking:
+            self.assistant_token += "<think>\n\n</think>\n\n"
+        self.generation_prompt = self.assistant_token
+        self.image_token = "<|image_pad|>"
+        self.vision_start_token = "<|vision_start|>"
+        self.vision_end_token = "<|vision_end|>"
+
+        if self.processor is not None:
+            self.patch_size = processor.image_processor.patch_size
+            self.merge_size = processor.image_processor.merge_size
+            self.patch_factor = self.patch_size * self.merge_size
+
+            self.image_folder_path = image_folder_path
+            self.resize_width = resize_width
+
+        from rllm.parser.tool_parser import QwenToolParser
+        self.tool_parser = QwenToolParser()
+
+    def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list = None, accumulate_reasoning: bool = False, **kwargs) -> str:
+        tools = tools or []
+        tools_prompt_str = ""
+        if tools:
+            try:
+                tool_schema_strs = []
+                for tool in tools:
+                    if hasattr(tool, 'json'):
+                        tool_schema_str = json.dumps(tool.json)
+                    elif isinstance(tool, dict):
+                        tool_schema_str = json.dumps(tool)
+                    else:
+                        tool_schema_str = tool
+                    tool_schema_strs.append(tool_schema_str)
+                tools_schema_str = "\n".join(tool_schema_strs)
+                tools_prompt_str = self.tool_parser.get_tool_prompt(tools_schema_str)
+            except Exception as e:
+                print(f"Failed to format tools: {e}")
+
+        result = ""
+
+        # if the first message is not a system message, add the system message
+        if is_first_msg and messages[0]["role"] != "system":
+            result += self.system_token + "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." + tools_prompt_str + self.eot_token
+
+        for message in messages:
+            if message["role"] == "system":
+                result += self.parse_system(message, tools_prompt_str)
+            elif message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message, accumulate_reasoning=accumulate_reasoning)
+            elif message["role"] == "tool":
+                tool_outputs_str = self.parse_tool(message)
+                result += tool_outputs_str
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+
+        return result
+
+    def parse_system(self, message, tools_prompt_str=""):
+        content = message["content"]
+        if "# Tools" not in content and tools_prompt_str:
+            content += tools_prompt_str
+        if "Current date:" not in content:
+            content += "\n\nCurrent date: " + datetime.date.today().strftime("%Y-%m-%d")
+        return self.system_token + content + self.eot_token
+
+    def parse_user(self, message):
+        return self.user_token + message["content"] + self.eot_token
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = (message.get("content", None) or "").strip()
+        reasoning = (message.get("reasoning", None) or "").strip()
+        tool_calls = message.get("tool_calls", None) or []
+
+        if not reasoning and not tool_calls:
+            return self.assistant_token + content + self.eot_token
+
+        else:
+            result = self.assistant_token
+            if reasoning and accumulate_reasoning:
+                result += "<think>\n" + reasoning
+                if content or tool_calls:
+                    result += "\n</think>\n\n"
+
+            if content:
+                result += content
+
+            if tool_calls:
+                try:
+                    tool_calls_strs = []
+                    for tool_call in tool_calls:
+                        if hasattr(tool_call, 'to_dict'):
+                            tool_call_dict = tool_call.to_dict()
+                        elif isinstance(tool_call, dict) and "function" in tool_call:
+                            tool_call_dict = tool_call["function"]
+                        else:
+                            tool_call_dict = tool_call
+                        arguments_obj = tool_call_dict.get("arguments")
+                        if isinstance(arguments_obj, str):
+                            try:
+                                arguments_obj = json.loads(arguments_obj)
+                            except json.JSONDecodeError:
+                                pass
+                        tool_call_for_dump = dict(tool_call_dict)
+                        if arguments_obj is not None:
+                            tool_call_for_dump["arguments"] = arguments_obj
+                        tool_call_str = f"{self.tool_parser.tool_call_begin}\n{json.dumps(tool_call_for_dump)}\n{self.tool_parser.tool_call_end}"
+                        tool_calls_strs.append(tool_call_str)
+                    tool_calls_str = "\n".join(tool_calls_strs)
+                except Exception as e:
+                    print(f"Failed to format tool calls: {e}")
+                    tool_calls_str = ""
+
+                result += tool_calls_str
+
+            result += self.eot_token
+            return result
+
+    def parse_tool(self, message):
+        tool_outputs = message.get("tool_outputs", [])
+        tool_outputs_strs = []
+
+        for tool_output in tool_outputs:
+            if hasattr(tool_output, 'to_dict'):
+                tool_output = tool_output.to_dict()
+
+            tool_output_str = f"{self.tool_parser.tool_output_begin}\n"
+
+            outputs = tool_output.get("output")
+            if isinstance(outputs, list):
+                for chunk in outputs:
+                    chunk_type = chunk.get("type")
+                    if chunk_type == "text":
+                        tool_output_str += chunk.get("text", "")
+                    elif chunk_type == "image":
+                        tool_output_str += f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
+            else:
+                tool_output_str += str(outputs)
+
+            tool_output_str += f"\n{self.tool_parser.tool_output_end}"
+            tool_outputs_strs.append(tool_output_str)
+        tool_outputs_str = "\n".join(tool_outputs_strs)
+
+        return self.user_token + tool_outputs_str + self.eot_token
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        if completion_text.count("</think>") == 1:
+            reasoning, _, content = completion_text.partition("</think>")
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            reasoning = reasoning.strip()
+            content = content.strip()
+        elif not self.disable_thinking:
+            # generation was cut short during reasoning
+            reasoning = completion_text
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            reasoning = reasoning.strip()
+            content = ""
+        else:
+            # thinking is disabled, so everything is content
+            reasoning = ""
+            content = completion_text
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            content = content.strip()
+
+        if content:
+            # parse tool calls from content
+            tool_calls = self.tool_parser.parse(content)
+            begin_pattern = re.escape(self.tool_parser.tool_call_begin)
+            end_pattern = re.escape(self.tool_parser.tool_call_end)
+            content = re.sub(f"{begin_pattern}.*?{end_pattern}", "", content, flags=re.DOTALL)
+            content = content.strip()
+        else:
+            tool_calls = []
+
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+        }
+
+    def process_image_data(self, messages):
+        from PIL import Image
+        from qwen_vl_utils import fetch_image
+
+        messages = deepcopy(messages)
+        image_paths = []
+        for message in messages:
+            if message["role"] == "tool":
+                tool_outputs = message.get("tool_outputs", [])
+                for tool_output in tool_outputs:
+                    if hasattr(tool_output, 'to_dict'):
+                        tool_output = tool_output.to_dict()
+                    output = tool_output.get("output")
+                    if isinstance(output, list):
+                        for chunk in output:
+                            if isinstance(chunk, dict):
+                                chunk_type = chunk.get("type")
+                                if chunk_type == "image":
+                                    image_paths.append(chunk.get("image"))
+
+        if self.processor is None and len(image_paths) > 0:
+            print("Found images in messages, but processor is not set. Skipping image processing.")
+            return None
+
+        image_data = []
+        for image_path in image_paths:
+            img = Image.open(os.path.join(self.image_folder_path, image_path)).convert("RGB")
+            if self.resize_width is not None:
+                w, h = img.size
+                aspect = h / w
+                target_h = int(self.resize_width * aspect)
+                target_w = round(self.resize_width / self.patch_factor) * self.patch_factor
+                target_h = round(target_h / self.patch_factor) * self.patch_factor
+                img = img.resize((target_w, target_h))
+
+            img = fetch_image({"image": img}, image_patch_size=self.patch_size)
+            image_data.append(img)
+
+        return image_data
+
+
+class KimiK2ThinkingChatTemplateParser(ChatTemplateParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self.tokenizer = tokenizer
+        self.eos_token = "<|im_end|>"
+        self.user_token = "<|im_user|>"
+        self.assistant_token = "<|im_assistant|>"
+        self.system_token = "<|im_system|>"
+        self.middle_token = "<|im_middle|>"
+        self.generation_prompt = f"{self.assistant_token}assistant{self.middle_token}"
+
+    def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list = None, accumulate_reasoning: bool = False, **kwargs) -> str:
+        if tools:
+            raise NotImplementedError("Tools are not supported yet")
+
+        result = ""
+
+        # Add default system message if first message is not system
+        if is_first_msg and (len(messages) == 0 or messages[0]["role"] != "system"):
+            result += f"{self.system_token}system{self.middle_token}You are Kimi, an AI assistant created by Moonshot AI.{self.eos_token}"
+
+        for message in messages:
+            if message["role"] == "system":
+                result += self.parse_system(message)
+            elif message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message, accumulate_reasoning=accumulate_reasoning)
+            elif message["role"] == "tool":
+                result += self.parse_tool(message)
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+
+        return result
+
+    def parse_system(self, message):
+        content = message.get("content", "")
+        return f"{self.system_token}system{self.middle_token}{content}{self.eos_token}"
+
+    def parse_user(self, message):
+        content = message.get("content", "")
+        return f"{self.user_token}user{self.middle_token}{content}{self.eos_token}"
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = message.get("content", "")
+        reasoning = message.get("reasoning", "")
+
+        result = f"{self.assistant_token}assistant{self.middle_token}"
+
+        if reasoning and accumulate_reasoning:
+            result += f"<think>{reasoning}</think>"
+        else:
+            result += "<think></think>"
+
+        if content:
+            result += content
+
+        result += self.eos_token
+        return result
+
+    def parse_tool(self, message):
+        raise NotImplementedError("Tools are not supported yet")
+
+    def parse_completion(self, completion_ids: list[int]) -> dict[str, str | list]:
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        # Remove end token if present
+        if completion_text.endswith(self.eos_token):
+            completion_text = completion_text[: -len(self.eos_token)]
+
+        # Parse thinking tags
+        if completion_text.count("</think>") == 1:
+            reasoning, _, content = completion_text.partition("</think>")
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            reasoning = reasoning.strip()
+            content = content.strip()
+        else:
+            # generation was cut short during reasoning or no thinking tags
+            if "<think>" in completion_text:
+                reasoning = completion_text
+                if reasoning.startswith("<think>"):
+                    reasoning = reasoning[len("<think>") :]
+                reasoning = reasoning.strip()
+                content = ""
+            else:
+                reasoning = ""
+                content = completion_text.strip()
 
         return {
             "content": content,

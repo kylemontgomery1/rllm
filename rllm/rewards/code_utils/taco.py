@@ -66,7 +66,10 @@ def timeout_handler(signum, frame):
     raise TimeoutException
 
 
-signal.signal(signal.SIGALRM, timeout_handler)
+try:
+    signal.signal(signal.SIGALRM, timeout_handler)
+except ValueError:
+    pass  # signal only works in main thread; skip in Ray workers
 TIMEOUT = 90  # seconds
 
 EXECUTION_RESULTS = {1: "passed", 0: "false", -1: "timeout", -2: "runtime_error", -3: "returncode:{code}", -4: "compile_error"}
@@ -148,19 +151,19 @@ def process_input_output(inputs, outputs):
     try:
         if isinstance(inputs[0], dict):
             inputs = [{int(k): v for k, v in inputs[0].items()}]
-    except:
+    except Exception:
         True
 
     try:
         if isinstance(outputs, dict):
             outputs = [{int(k): v for k, v in outputs.items()}]
-    except:
+    except Exception:
         True
 
     try:
         if isinstance(outputs[0], dict):
             outputs = [{int(k): v for k, v in outputs[0].items()}]
-    except:
+    except Exception:
         True
 
     return inputs, outputs
@@ -190,7 +193,7 @@ def compile_and_get_func(program, which_type, method_name, timeout, debug):
         signal.alarm(timeout)
         method = getattr(tmp, method_name)  # get_attr second arg must be str
         signal.alarm(0)
-    except:
+    except Exception:
         signal.alarm(0)
         e = sys.exc_info()
         if debug:
@@ -325,7 +328,7 @@ def execute_cb_code(method, inputs_list, outputs_list, timeout, early_stop=True,
                 if isinstance(exec_outputs[0], tuple):
                     exec_outputs = [list(x) for x in exec_outputs]
                     tmp_result = tmp_result or (exec_outputs == outputs[0])
-            except:
+            except Exception:
                 True
             if tmp_result:
                 results.append((True, EXECUTION_RESULTS[1]))
@@ -379,7 +382,15 @@ def execute_std_code(method, synthesized_code, inputs_list, outputs_list, timeou
             temp_file_name = temp_input.name
             stdout, stderr = "", ""
             try:
-                result = subprocess.run(["bash", "-c", "ulimit -v 10485760; python3 " + temp_program_path], stdin=temp_input, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid, timeout=timeout, text=True)
+                result = subprocess.run(
+                    ["bash", "-c", "ulimit -v 10485760; python3 " + temp_program_path],
+                    stdin=temp_input,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    preexec_fn=os.setsid,
+                    timeout=timeout,
+                    text=True,
+                )
 
                 stdout, stderr = result.stdout, result.stderr
                 return_code = result.returncode

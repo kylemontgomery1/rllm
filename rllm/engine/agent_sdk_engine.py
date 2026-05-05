@@ -9,19 +9,24 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
-import torch
 from tqdm import tqdm
+
+try:
+    import numpy as np
+    import torch
+except ImportError as err:
+    raise ImportError("AgentSdkEngine requires extra dependencies. Install with: pip install rllm[train]") from err
 
 from rllm.agents.agent import Episode, Trajectory
 from rllm.engine.rollout import ModelOutput, RolloutEngine
 from rllm.engine.rollout.verl_engine import VerlEngine
 from rllm.sdk.data_process import group_steps, trace_to_step
-from rllm.sdk.protocol import Trace, TrajectoryView
+from rllm.sdk.protocol import Trace
 from rllm.sdk.proxy.proxy_manager import VerlProxyManager
 from rllm.sdk.session import SESSION_BACKEND
 from rllm.sdk.session.base import wrap_with_session_context
 from rllm.sdk.store.sqlite_store import SqliteTraceStore
+from rllm.types import Trajectory as BaseTrajectory
 from rllm.utils import colorful_print
 from rllm.workflows.workflow import TerminationReason
 
@@ -35,7 +40,18 @@ logger = logging.getLogger(__name__)
 
 
 class AgentSdkEngine:
-    def __init__(self, agent_run_func: Callable, rollout_engine: RolloutEngine, config=None, n_parallel_tasks: int = 128, retry_limit: int = 3, raise_on_error: bool = True, proxy_config: dict | None = None, tracer: Optional["TracerProtocol"] = None, **kwargs):
+    def __init__(
+        self,
+        agent_run_func: Callable,
+        rollout_engine: RolloutEngine,
+        config=None,
+        n_parallel_tasks: int = 128,
+        retry_limit: int = 3,
+        raise_on_error: bool = True,
+        proxy_config: dict | None = None,
+        tracer: Optional["TracerProtocol"] = None,
+        **kwargs,
+    ):
         """Initialize SdkEngine for executing agent_run_func on multiple tasks.
 
         Args:
@@ -107,7 +123,13 @@ class AgentSdkEngine:
         requires_sync_storage = SESSION_BACKEND == "opentelemetry"
 
         if requires_sync_storage and proxy_mode == "external":
-            logger.warning("OpenTelemetry-based sessions require synchronous storage mode for proper synchronization. When using external proxy mode, ensure the proxy is started with --sync-tracer flag. Alternatively, use proxy_mode='subprocess' to automatically enable sync storage. Without sync storage, there may be synchronization issues between tracer persistence and session reads.")
+            logger.warning(
+                "OpenTelemetry-based sessions require synchronous storage mode for proper synchronization. "
+                "When using external proxy mode, ensure the proxy is started with --sync-tracer flag. "
+                "Alternatively, use proxy_mode='subprocess' to automatically enable sync storage. "
+                "Without sync storage, there may be synchronization issues between tracer persistence "
+                "and session reads."
+            )
 
         add_logprobs = proxy_config.get("add_logprobs", False)
 
@@ -212,7 +234,7 @@ class AgentSdkEngine:
                     colorful_print(f"[{uid}] Rollout completed with reward: {float(output)}", fg="green" if float(output) > 0 else "yellow")
                     return task_id, rollout_idx, retry_attempt, float(output), session_uid
                 elif success and isinstance(output, list):
-                    assert all(isinstance(t, TrajectoryView) for t in output), "Must be a list of TrajectoryView"
+                    assert all(isinstance(t, BaseTrajectory) for t in output), "Must be a list of Trajectory"
                     return task_id, rollout_idx, retry_attempt, output, session_uid
                 elif success and isinstance(output, tuple):
                     assert len(output) == 2, "Must be a tuple of (payload, metrics)"
@@ -221,7 +243,7 @@ class AgentSdkEngine:
                         colorful_print(f"[{uid}] Rollout completed with reward: {float(payload)}", fg="green" if float(payload) > 0 else "yellow")
                         return task_id, rollout_idx, retry_attempt, (float(payload), metrics), session_uid
                     elif isinstance(payload, list):
-                        assert all(isinstance(t, TrajectoryView) for t in payload), "Must be a list of TrajectoryView"
+                        assert all(isinstance(t, BaseTrajectory) for t in payload), "Must be a list of Trajectory"
                         return task_id, rollout_idx, retry_attempt, (payload, metrics), session_uid
                     else:
                         raise ValueError(f"Invalid output type: {type(output)}")
@@ -514,7 +536,11 @@ class AgentSdkEngine:
                 # if not self.config.rllm.stepwise_advantage.enable:
                 #     if len(trajectory.steps) > 1:
                 #         if not trajectory.is_cumulative():
-                #             logger.warning(f"Warning: Multi-step trajectory {trajectory_id} is not cumulative, but stepwise mode is not enabled. There could be a token mismatch during trajectory generation.")
+                #             logger.warning(
+                #                 f"Warning: Multi-step trajectory {trajectory_id} is not cumulative, "
+                #                 "but stepwise mode is not enabled. There could be a token mismatch "
+                #                 "during trajectory generation."
+                #             )
 
                 #         chat_completions = trajectory.steps[-1].chat_completions
                 #         prompt, response, mask = self.rollout_engine.chat_parser.tokenize_and_mask_cumulative(chat_completions)
@@ -664,7 +690,15 @@ class AgentSdkEngine:
         if cf.enable:
             for i in range(len(episode_ids)):
                 termination_reason = termination_reasons[i]
-                if (cf.mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED) or (cf.mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED) or (cf.mask_env_done and termination_reason == TerminationReason.ENV_DONE) or (cf.mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED) or (cf.mask_timeout and termination_reason == TerminationReason.TIMEOUT) or (cf.mask_unknown and termination_reason == TerminationReason.UNKNOWN) or (cf.mask_error and termination_reason == TerminationReason.ERROR):
+                if (
+                    (cf.mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
+                    or (cf.mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED)
+                    or (cf.mask_env_done and termination_reason == TerminationReason.ENV_DONE)
+                    or (cf.mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED)
+                    or (cf.mask_timeout and termination_reason == TerminationReason.TIMEOUT)
+                    or (cf.mask_unknown and termination_reason == TerminationReason.UNKNOWN)
+                    or (cf.mask_error and termination_reason == TerminationReason.ERROR)
+                ):
                     is_valid[i] = False  # set flag to filter out the episode later (after advantages are computed)
 
         # Build tensors dict, conditionally include rollout_log_probs if available

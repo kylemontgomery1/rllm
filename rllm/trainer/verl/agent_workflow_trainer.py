@@ -9,6 +9,7 @@ from pprint import pprint
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor
 from verl.single_controller.ray import RayWorkerGroup
@@ -29,7 +30,9 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
 )
 from verl.trainer.ppo.utils import Role, WorkerType
+from verl.utils import tensordict_utils as tu
 from verl.utils.debug import marked_timer
+from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from rllm.engine.agent_workflow_engine import AgentWorkflowEngine
 from rllm.engine.rollout.verl_engine import VerlEngine
@@ -51,8 +54,17 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
         workflow_class=None,
         workflow_args=None,
     ):
-        super().__init__(config=config, tokenizer=tokenizer, processor=processor, role_worker_mapping=role_worker_mapping, resource_pool_manager=resource_pool_manager, ray_worker_group_cls=ray_worker_group_cls, reward_fn=reward_fn, val_reward_fn=val_reward_fn)
+        super().__init__(
+            config=config,
+            tokenizer=tokenizer,
+            processor=processor,
+            role_worker_mapping=role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls,
+        )
 
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
         self.workflow_class = workflow_class
         self.workflow_args = workflow_args or {}
         self._validate_config()
@@ -142,6 +154,7 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
 
         # perform validation before training
         import time
@@ -181,14 +194,13 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 new_batch.non_tensor_batch["task_ids"] = np.array([str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object)
                 new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n)
 
-                new_batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"], non_tensor_batch_keys=["raw_prompt_ids"])
-
                 # Update training step in engine for episode logging
                 self.agent_execution_engine.set_training_step(self.global_steps, mode="train", epoch=epoch)
 
                 with marked_timer("step", timing_raw):
                     # generate trajectories
                     final_gen_batch_output = self.generate_trajectories(batch=new_batch, timing_raw=timing_raw)
+                    self.checkpoint_manager.sleep_replicas()
 
                     # need to repeat to make shape match
                     repeat_counts = final_gen_batch_output.meta_info["repeat_counts"]
@@ -225,6 +237,12 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                             seen_episodes.add(episode_id)
                             episode_unique_idxs.append(i)
                     episode_unique_batch = new_batch.select_idxs(episode_unique_idxs)
+
+                    # Include termination reasons from episodes that were dropped before producing any steps.
+                    # These are reported via meta_info from AgentWorkflowEngine.transform_results_for_verl.
+                    dropped_episodes = final_gen_batch_output.meta_info.get("dropped_episodes", [])
+                    for ep in dropped_episodes:
+                        termination_counts.update([ep.get("termination_reason", "unknown")])
 
                     # log metrics returned by workflows
                     for metric_dict in episode_unique_batch.non_tensor_batch["metrics"]:
@@ -295,9 +313,41 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                         # then we just pad the batch size to a multiple of world size
                         batch = self._pad_dataproto_to_world_size(batch=batch)
 
+                    # Balance the number of valid tokens across DP ranks BEFORE compute operations.
+                    # This must happen before compute_log_prob to prevent NCCL desync when workers
+                    # process micro-batches with uneven token distributions.
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
+
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # get images_seqlens
+                    if "multi_modal_inputs" in batch.non_tensor_batch.keys():
+                        images_seqlens_all = []
+                        for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                            if "image_grid_thw" not in multi_modal_input.keys():
+                                continue
+                            images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                        batch.meta_info["images_seqlens"] = images_seqlens_all
+                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
                     # recompute old_log_probs
+                    # Mirror verl's RayPPOTrainer._compute_old_log_prob: the new EngineWorker
+                    # path (use_legacy_worker_impl == "disable") takes a TensorDict in no-padding
+                    # format; the legacy AsyncActorRolloutRefWorker takes a DataProto directly.
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        if self.use_legacy_worker_impl == "disable":
+                            batch_td = batch.to_tensordict()
+                            batch_td = left_right_2_no_padding(batch_td)
+                            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False, temperature=self.config.actor_rollout_ref.rollout.temperature)
+                            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch_td)
+                            # New worker returns TensorDict in no-padding format
+                            entropy = tu.get(old_log_prob_output, "entropy")
+                            log_probs = tu.get(old_log_prob_output, "log_probs")
+                            entropy = no_padding_2_padding(entropy, batch_td)
+                            log_probs = no_padding_2_padding(log_probs, batch_td)
+                            old_log_prob = DataProto.from_tensordict(tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()}))
+                        else:
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -316,10 +366,27 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            if self.use_legacy_worker_impl == "disable":
+                                # Reuse batch_td from old_log_prob, but override the metadata for
+                                # the ref step (verl's RayPPOTrainer._compute_ref_log_prob pattern).
+                                # When ref_in_actor (LoRA), we use the actor worker's compute_log_prob
+                                # with no_lora_adapter=True so the base model is used for ref.
+                                ref_metadata = {"calculate_entropy": False, "compute_loss": False}
+                                if self.ref_in_actor:
+                                    ref_metadata["no_lora_adapter"] = True
+                                tu.assign_non_tensor(batch_td, **ref_metadata)
+                                if self.ref_in_actor:
+                                    ref_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch_td)
+                                else:
+                                    ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+                                ref_lp = tu.get(ref_log_prob_output, "log_probs")
+                                ref_lp = no_padding_2_padding(ref_lp, batch_td)
+                                ref_log_prob = DataProto.from_tensordict(tu.get_tensordict({"ref_log_prob": ref_lp.float()}))
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                if not self.ref_in_actor:
+                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                else:
+                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
@@ -392,17 +459,6 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                     # re-pad batch size to world size for gradient update
                     batch = self._pad_dataproto_to_world_size(batch=batch)
 
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
-
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -412,22 +468,47 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # Mirror verl's RayPPOTrainer._update_actor: meta_info goes onto the
+                        # DataProto for the legacy worker; the new EngineWorker path needs a
+                        # TensorDict in no-padding format with training metadata set via
+                        # tu.assign_non_tensor.
+                        batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                        if self.use_legacy_worker_impl == "disable":
+                            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+                            update_batch = batch.to_tensordict()
+                            update_batch = left_right_2_no_padding(update_batch)
+                            tu.assign_non_tensor(
+                                update_batch,
+                                calculate_entropy=(self.config.actor_rollout_ref.actor.entropy_coeff != 0.0),
+                                global_batch_size=ppo_mini_batch_size,
+                                mini_batch_size=ppo_mini_batch_size,
+                                epochs=self.config.actor_rollout_ref.actor.ppo_epochs,
+                                seed=self.config.actor_rollout_ref.actor.data_loader_seed,
+                                dataloader_kwargs={"shuffle": self.config.actor_rollout_ref.actor.shuffle},
+                            )
+                        else:
+                            update_batch = batch
+
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            actor_output = self.actor_rollout_wg.update_actor(update_batch)
+
+                        # save checkpoint
+                        if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
+
+                        # update weights from trainer to rollout
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
+
+                        # verl 0.7.1 new worker returns TensorDict; extract metrics
+                        if isinstance(actor_output, TensorDict):
+                            actor_output_metrics = reduce_metrics(tu.get(actor_output, "metrics"))
+                        else:
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
-                    # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
-                        with marked_timer("testing", timing_raw, color="green"):
-                            self.agent_execution_engine.set_training_step(self.global_steps, mode="val", epoch=epoch)
-                            val_metrics: dict = self._validate_agent()
-                        metrics.update(val_metrics)
-
-                    if self.config.trainer.save_freq > 0 and self.global_steps % self.config.trainer.save_freq == 0:
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
-                            self._save_checkpoint()
 
                     # Visualize some sample trajectories
                     if batch is not None and len(batch) > 0:
@@ -438,6 +519,13 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                             sample_indices = np.random.choice(batch_size, size=num_samples, replace=False)
                             for idx in sample_indices:
                                 self.visualize_trajectory_last_step(batch, sample_idx=idx, max_samples=1)
+
+                # validate
+                if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and self.global_steps % self.config.trainer.test_freq == 0:
+                    with marked_timer("testing", timing_raw, color="green"):
+                        self.agent_execution_engine.set_training_step(self.global_steps, mode="val", epoch=epoch)
+                        val_metrics: dict = self._validate_agent()
+                    metrics.update(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):
                     self._stop_profiling(do_profile)
@@ -463,8 +551,10 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 for key, value in workflow_metrics.items():
                     metrics[f"batch/{key}"] = np.mean(value)
 
+                # Denominator should be the number of attempted tasks (including those dropped before 1st step),
+                # otherwise metrics are biased/inflated.
                 for r in TerminationReason:
-                    metrics[f"batch/{r.value}"] = termination_counts[r.value] / len(set(new_batch.non_tensor_batch["episode_ids"]))
+                    metrics[f"batch/{r.value}"] = termination_counts[r.value] / max(1, num_tasks)
 
                 metrics["batch/num_tasks"] = num_tasks
 
@@ -512,10 +602,26 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
 
-            test_batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"], non_tensor_batch_keys=["raw_prompt_ids"])  # these are not needed for environment based interaction
             test_batch.meta_info = {"validate": True}
 
+            # Keep a mapping from task_id -> data_source so we can account for dropped episodes.
+            base_data_sources = test_batch.non_tensor_batch.get("data_source", None)
+            if base_data_sources is None:
+                base_data_sources = ["unknown"] * len(test_batch)
+            task_to_source = dict(zip(test_batch.non_tensor_batch["task_ids"].tolist(), base_data_sources, strict=False))
+
             test_output_gen_batch = self.generate_trajectories(batch=test_batch)
+
+            # Account for dropped episodes in validation metrics to avoid inflated pass@k.
+            dropped_episodes = test_output_gen_batch.meta_info.get("dropped_episodes", [])
+            for ep in dropped_episodes:
+                uid = ep.get("task_id")
+                if uid is None:
+                    continue
+                is_correct_lst.append(False)
+                uid_lst.append(uid)
+                data_source_lst.append(task_to_source.get(uid, "unknown"))
+
             repeat_counts = test_output_gen_batch.meta_info["repeat_counts"]
             # need to repeat to make shape match
             test_batch = test_batch.sample_level_repeat(repeat_counts)
@@ -577,9 +683,19 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             try:
                 # Concatenate all validation batches
                 combined_batch = DataProto.concat(batches_for_distill)
+                combined_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # Compute old_log_probs for distillation
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(combined_batch)
+                if self.use_legacy_worker_impl == "disable":
+                    # New worker path: convert to TensorDict + no-padding, then convert back.
+                    cb_td = combined_batch.to_tensordict()
+                    cb_td = left_right_2_no_padding(cb_td)
+                    tu.assign_non_tensor(cb_td, calculate_entropy=True, compute_loss=False, temperature=self.config.actor_rollout_ref.rollout.temperature)
+                    old_log_prob_output = self.actor_rollout_wg.compute_log_prob(cb_td)
+                    log_probs = tu.get(old_log_prob_output, "log_probs")
+                    log_probs = no_padding_2_padding(log_probs, cb_td)
+                    old_log_prob = DataProto.from_tensordict(tu.get_tensordict({"old_log_probs": log_probs.float()}))
+                else:
+                    old_log_prob = self.actor_rollout_wg.compute_log_prob(combined_batch)
                 combined_batch = combined_batch.union(old_log_prob)
 
                 # Compute distillation advantages
@@ -819,7 +935,9 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             traj_ep_to_scalar_adv[(traj_id, eps_id)] = scalar
 
         # Create new tensor for non_last_step_batch with per-token assignment
-        scalar_rows = torch.stack([torch.full_like(tgt_mask[i], fill_value=traj_ep_to_scalar_adv[(traj_id, eps_id)], dtype=torch.float32) for i, (traj_id, eps_id) in enumerate(zip(tgt_traj_ids, tgt_eps_ids, strict=False))])  # shape: (N2, T)
+        scalar_rows = torch.stack(
+            [torch.full_like(tgt_mask[i], fill_value=traj_ep_to_scalar_adv[(traj_id, eps_id)], dtype=torch.float32) for i, (traj_id, eps_id) in enumerate(zip(tgt_traj_ids, tgt_eps_ids, strict=False))]
+        )  # shape: (N2, T)
 
         # Apply the response mask of the target batch
         final_advantage = scalar_rows * tgt_mask

@@ -80,11 +80,11 @@ class AgentSdkTrainer(RayPPOTrainer):
     def init_workers(self):
         """Initialize workers with instrumented vLLM servers for distributed rollouts."""
         import ray
-        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServerBase, vLLMReplica
+        from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 
         # Create an instrumented vLLM HTTP server class
         @ray.remote(num_cpus=1)
-        class InstrumentedvLLMHttpServer(vLLMHttpServerBase):
+        class InstrumentedvLLMHttpServer(vLLMHttpServer):
             """vLLM HTTP server with automatic vLLM instrumentation in Ray worker."""
 
             def __init__(self, *args, **kwargs):
@@ -175,6 +175,7 @@ class AgentSdkTrainer(RayPPOTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
 
         start_time = time.time()
         if self.config.trainer.get("val_before_train", True):
@@ -210,11 +211,10 @@ class AgentSdkTrainer(RayPPOTrainer):
                 new_batch.non_tensor_batch["task_ids"] = np.array([str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object)
                 new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n)
 
-                new_batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"], non_tensor_batch_keys=["raw_prompt_ids"])
-
                 with marked_timer("step", timing_raw):
                     # generate trajectories
                     final_gen_batch_output = self.generate_trajectories(batch=new_batch, timing_raw=timing_raw)
+                    self.checkpoint_manager.sleep_replicas()
 
                     # need to repeat to make shape match
                     repeat_counts = final_gen_batch_output.meta_info["repeat_counts"]
@@ -475,6 +475,9 @@ class AgentSdkTrainer(RayPPOTrainer):
                         with marked_timer("save_checkpoint", timing_raw, color="green"):
                             self._save_checkpoint()
 
+                        # update weights from trainer to rollout
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
                     # Visualize some sample trajectories
                     if batch is not None and len(batch) > 0:
                         # Randomly select a few samples to visualize
@@ -551,7 +554,6 @@ class AgentSdkTrainer(RayPPOTrainer):
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
 
-            test_batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"], non_tensor_batch_keys=["raw_prompt_ids"])  # these are not needed for environment based interaction
             test_batch.meta_info = {"validate": True}
 
             test_output_gen_batch = self.generate_trajectories(batch=test_batch)
@@ -661,7 +663,9 @@ class AgentSdkTrainer(RayPPOTrainer):
             traj_ep_to_scalar_adv[(traj_id, eps_id)] = scalar
 
         # Create new tensor for non_last_step_batch with per-token assignment
-        scalar_rows = torch.stack([torch.full_like(tgt_mask[i], fill_value=traj_ep_to_scalar_adv[(traj_id, eps_id)], dtype=torch.float32) for i, (traj_id, eps_id) in enumerate(zip(tgt_traj_ids, tgt_eps_ids, strict=False))])  # shape: (N2, T)
+        scalar_rows = torch.stack(
+            [torch.full_like(tgt_mask[i], fill_value=traj_ep_to_scalar_adv[(traj_id, eps_id)], dtype=torch.float32) for i, (traj_id, eps_id) in enumerate(zip(tgt_traj_ids, tgt_eps_ids, strict=False))]
+        )  # shape: (N2, T)
 
         # Apply the response mask of the target batch
         final_advantage = scalar_rows * tgt_mask

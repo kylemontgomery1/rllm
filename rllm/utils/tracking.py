@@ -22,6 +22,8 @@ import json
 import numbers
 import os
 import pprint
+import sys
+import time
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -77,9 +79,10 @@ class Tracking:
         "clearml",
         "trackio",
         "file",
+        "ui",
     ]
 
-    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
+    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None, source_metadata=None):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -93,12 +96,30 @@ class Tracking:
         self.logger = {}
         self._finished = False  # Track whether finish() has been called
 
+        # Nudge users to enable UI logging
+        if "ui" not in default_backend:
+            try:
+                import os as _os
+
+                from rllm.experimental.eval.config import load_ui_config
+
+                ui_config = load_ui_config()
+                has_key = bool(_os.getenv("RLLM_API_KEY") or ui_config.get("ui_api_key"))
+                if has_key:
+                    print("\033[1;34mrllm-ui\033[0m: Add \033[1m'ui'\033[0m to your logger list for live monitoring in rllm UI")
+                else:
+                    print("\033[1;34mrllm-ui\033[0m: Run \033[1mrllm login\033[0m to enable live monitoring in rllm UI")
+            except Exception:
+                pass
+
+        rllm_config = config.get("rllm", {}) if config is not None else {}
+
         if "tracking" in default_backend or "wandb" in default_backend:
             import wandb
 
             settings = None
-            if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+            if rllm_config and rllm_config.get("trainer", {}).get("wandb_proxy", None):
+                settings = wandb.Settings(https_proxy=rllm_config["trainer"]["wandb_proxy"])
             wandb.init(project=project_name, name=experiment_name, config=config, settings=settings)
             self.logger["wandb"] = wandb
 
@@ -178,10 +199,27 @@ class Tracking:
         if "file" in default_backend:
             self.logger["file"] = FileLogger(project_name, experiment_name)
 
-    def log(self, data, step, backend=None):
+        if "ui" in default_backend:
+            self.logger["ui"] = UILogger(project_name, experiment_name, config, source_metadata=source_metadata)
+
+    def log(self, data, step, backend=None, episodes=None, trajectory_groups=None, commit=None):
+        """Log metrics and optionally episodes/trajectory_groups to configured backends.
+
+        Args:
+            data: Dictionary of metrics to log
+            step: Current training step
+            backend: Optional list of backends to log to (default: all)
+            episodes: Optional list of Episode objects (only used by UILogger)
+            trajectory_groups: Optional list of TrajectoryGroup objects (only used by UILogger)
+        """
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                if default_backend == "ui":
+                    logger_instance.log(data=data, step=step, episodes=episodes, trajectory_groups=trajectory_groups)
+                elif default_backend == "wandb" and commit is not None:
+                    logger_instance.log(data=data, step=step, commit=commit)
+                else:
+                    logger_instance.log(data=data, step=step)
 
     def finish(self):
         """Explicitly finish and cleanup all loggers.
@@ -206,6 +244,8 @@ class Tracking:
             self.logger["trackio"].finish()
         if "file" in self.logger:
             self.logger["file"].finish()
+        if "ui" in self.logger:
+            self.logger["ui"].finish()
 
         self.logger.clear()
         self._finished = True
@@ -217,6 +257,389 @@ class Tracking:
         on __del__, as garbage collection timing can be unpredictable.
         """
         self.finish()
+
+
+class TeeStream:
+    """Wraps a stream to also send lines to the UI backend."""
+
+    def __init__(self, original, client, session_id, stream_name="stdout"):
+        self._original = original
+        self._client = client
+        self._session_id = session_id
+        self._stream_name = stream_name
+        self._line_buffer = ""
+        self._log_buffer = []
+        self._buffer_size = 20
+        self._last_flush = time.time()
+        self._flush_interval = 2.0
+
+    def write(self, text):
+        self._original.write(text)
+        self._line_buffer += text
+        while "\n" in self._line_buffer:
+            line, self._line_buffer = self._line_buffer.split("\n", 1)
+            if line.strip():
+                self._log_buffer.append(line)
+        # Auto-flush when buffer is full or interval elapsed
+        if len(self._log_buffer) >= self._buffer_size or (self._log_buffer and time.time() - self._last_flush >= self._flush_interval):
+            self._send_buffer()
+
+    def flush(self):
+        self._original.flush()
+        # Flush remaining partial line
+        if self._line_buffer.strip():
+            self._log_buffer.append(self._line_buffer)
+            self._line_buffer = ""
+        if self._log_buffer:
+            self._send_buffer()
+
+    def isatty(self):
+        # Report as TTY so libraries (Rich, tqdm, etc.) emit ANSI color codes
+        return True
+
+    def _send_buffer(self):
+        if not self._log_buffer:
+            return
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        logs = [{"session_id": self._session_id, "timestamp": now, "stream": self._stream_name, "message": line} for line in self._log_buffer]
+        self._log_buffer = []
+        self._last_flush = time.time()
+        try:
+            self._client.post("/api/logs/batch", json={"session_id": self._session_id, "logs": logs})
+        except Exception:
+            pass  # Silently ignore - don't break training if UI is down
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+class UILogger:
+    """Logger that sends training data to the rLLM UI backend via HTTP.
+
+    This logger sends both aggregated metrics and detailed episode data (including
+    trajectories and step-by-step execution) to a FastAPI backend for visualization.
+
+    Args:
+        project_name: Name of the project
+        experiment_name: Name of the experiment/run
+        config: Training configuration dict
+    """
+
+    def __init__(self, project_name: str, experiment_name: str, config, source_metadata=None, session_type: str = "training"):
+        import logging
+        import queue
+        import threading
+
+        import httpx
+
+        self.logger = logging.getLogger(__name__)
+        self.session_type = session_type
+        from rllm.experimental.eval.config import load_ui_config
+
+        ui_config = load_ui_config()
+        api_key = os.getenv("RLLM_API_KEY") or ui_config.get("ui_api_key")
+        ui_url = os.getenv("RLLM_UI_URL")
+        if not ui_url:
+            ui_url = "https://ui.rllm-project.com" if api_key else "http://localhost:3000"
+        self.ui_url = ui_url
+        headers = {}
+        if api_key:
+            headers["X-API-Key"] = api_key
+        self.client = httpx.Client(base_url=self.ui_url, timeout=5.0, headers=headers)
+        self._heartbeat_stop = threading.Event()
+
+        try:
+            # Create session with source metadata
+            response = self.client.post(
+                "/api/sessions",
+                json={"project": project_name, "experiment": experiment_name, "config": config, "source_metadata": source_metadata or {}, "session_type": session_type},
+            )
+            response.raise_for_status()
+            resp_data = response.json()
+            self.session_id = resp_data.get("id") or resp_data.get("session_id")
+            self.logger.info(f"UILogger initialized with session_id: {self.session_id}")
+
+            # Build clickable session URL
+            # For local dev, the frontend runs on a different port (default 5173)
+            # than the API backend (default 3000). In production they share a domain.
+            from urllib.parse import urlparse
+
+            parsed = urlparse(self.ui_url)
+            if parsed.hostname in ("localhost", "127.0.0.1"):
+                frontend_base = f"{parsed.scheme}://localhost:5173"
+            else:
+                frontend_base = self.ui_url
+
+            if session_type == "eval":
+                self.session_url = f"{frontend_base}/evaluation/{self.session_id}"
+            else:
+                self.session_url = f"{frontend_base}/runs/{self.session_id}"
+
+            # Print before TeeStream install so it goes to real stdout
+            print(f"\033[1;34mrllm-ui\033[0m: View run at \033[4;34m{self.session_url}\033[0m")
+
+            # Send initial heartbeat
+            try:
+                self.client.post(f"/api/sessions/{self.session_id}/heartbeat")
+            except Exception:
+                pass
+
+            # Start heartbeat daemon thread
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
+
+            # Background log worker
+            self._queue = queue.Queue(maxsize=64)
+            self._worker_stop = threading.Event()
+            self._worker_thread = threading.Thread(target=self._log_worker, daemon=True)
+            self._worker_thread.start()
+
+            # Install TeeStream to capture stdout/stderr
+            self._original_stdout = sys.stdout
+            self._original_stderr = sys.stderr
+            sys.stdout = TeeStream(sys.stdout, self.client, self.session_id, "stdout")
+            sys.stderr = TeeStream(sys.stderr, self.client, self.session_id, "stderr")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize UILogger: {e}")
+            self.session_id = None
+
+    def _heartbeat_loop(self):
+        """Send heartbeat every 30 seconds until stopped."""
+        while not self._heartbeat_stop.wait(30):
+            if self.session_id is None:
+                break
+            try:
+                self.client.post(f"/api/sessions/{self.session_id}/heartbeat")
+            except Exception:
+                pass
+
+    def _log_worker(self):
+        """Background worker that sends log data to the UI backend."""
+        import queue
+
+        while True:
+            try:
+                item = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._worker_stop.is_set():
+                    return
+                continue
+            if item is None:  # sentinel for shutdown
+                self._queue.task_done()
+                return
+            step, metrics_payload, episodes_payloads, groups_payloads = item
+            try:
+                self._send_log_data(step, metrics_payload, episodes_payloads, groups_payloads)
+            except Exception as e:
+                self.logger.warning(f"UILogger worker failed for step {step}: {e}")
+            finally:
+                self._queue.task_done()
+
+    def _send_log_data(self, step, metrics_payload, episodes_payloads, groups_payloads):
+        """Send pre-serialized data to UI backend. Runs on worker thread."""
+        if metrics_payload is not None:
+            try:
+                self.logger.info(f"Sending metrics to UI [step {step}]")
+                self.client.post("/api/metrics", json=metrics_payload)
+            except Exception as e:
+                self.logger.warning(f"Failed to send metrics to UI: {e}")
+
+        if episodes_payloads:
+            try:
+                self.logger.info(f"Sending {len(episodes_payloads)} episodes to UI [step {step}]")
+                # Batch upload — single request for all episodes
+                batch_payload = {"session_id": self.session_id, "episodes": episodes_payloads}
+                resp = self.client.post("/api/episodes/batch", json=batch_payload)
+                resp.raise_for_status()
+                self.logger.info(f"Sent {len(episodes_payloads)} episodes via batch endpoint")
+            except Exception as batch_err:
+                # Fallback to individual POSTs for older UI servers without batch endpoint
+                self.logger.info(f"Batch endpoint failed ({batch_err}), falling back to individual POSTs")
+                for ep in episodes_payloads:
+                    try:
+                        self.client.post("/api/episodes", json=ep)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send episode to UI: {e}")
+                else:
+                    self.logger.info(f"Sent {len(episodes_payloads)} episodes individually")
+
+        if groups_payloads:
+            try:
+                self.logger.info(f"Sending {len(groups_payloads)} trajectory groups to UI [step {step}]")
+                batch_payload = {"session_id": self.session_id, "groups": groups_payloads}
+                resp = self.client.post("/api/trajectory-groups/batch", json=batch_payload)
+                resp.raise_for_status()
+                self.logger.info(f"Sent {len(groups_payloads)} trajectory groups via batch endpoint")
+            except Exception as batch_err:
+                self.logger.info(f"Trajectory groups batch endpoint failed ({batch_err}), falling back to individual POSTs")
+                for gp in groups_payloads:
+                    try:
+                        self.client.post("/api/trajectory-groups", json=gp)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send trajectory group to UI: {e}")
+                else:
+                    self.logger.info(f"Sent {len(groups_payloads)} trajectory groups individually")
+
+    def log(self, data, step, episodes=None, trajectory_groups=None):
+        """Log metrics and optionally episodes/trajectory_groups.
+
+        Serializes data immediately (to snapshot before mutation), then
+        enqueues for background sending so the training loop is not blocked.
+        """
+        if self.session_id is None:
+            return
+
+        import json
+        import queue
+
+        # Serialize metrics (snapshot before mutation), skip empty data
+        metrics_payload = None
+        if data:
+            try:
+                metrics_json = json.loads(json.dumps(data, default=self._json_serializer))
+                metrics_payload = {"session_id": self.session_id, "step": step, "data": metrics_json}
+                self.logger.info(f"Queueing metrics to send to UI [step {step}]")
+            except Exception as e:
+                self.logger.warning(f"Failed to serialize metrics: {e}")
+
+        # Serialize episodes
+        episodes_payloads = None
+        if episodes:
+            try:
+                _STEP_DROP_KEYS = {"prompt_ids", "response_ids", "logprobs", "model_output"}
+                episodes_payloads = []
+                for episode in episodes:
+                    ep = episode.to_dict() if hasattr(episode, "to_dict") else episode.model_dump()
+                    ep["session_id"] = self.session_id
+                    ep["session_type"] = self.session_type
+                    ep["step"] = step
+                    ep["episode_id"] = ep.pop("id")
+                    for traj in ep.get("trajectories", []):
+                        for s in traj.get("steps", []):
+                            for key in _STEP_DROP_KEYS:
+                                s.pop(key, None)
+                    episodes_payloads.append(json.loads(json.dumps(ep, default=self._json_serializer)))
+                self.logger.info(f"Queueing {len(episodes_payloads)} episodes to send to UI [step {step}]")
+            except Exception as e:
+                self.logger.warning(f"Failed to serialize episodes: {e}")
+
+        # Serialize trajectory groups
+        groups_payloads = None
+        if trajectory_groups:
+            try:
+                groups_payloads = []
+                for group in trajectory_groups:
+                    rewards = [float(t.reward) for t in group.trajectories if t.reward is not None]
+                    gd = {
+                        "session_id": self.session_id,
+                        "step": step,
+                        "group_id": group.group_id,
+                        "num_trajectories": len(group.trajectories),
+                        "avg_reward": sum(rewards) / len(rewards) if rewards else None,
+                        "metadata": [{"episode_id": f"{m['task_id']}:{m['rollout_idx']}"} for m in group.metadata],
+                    }
+                    groups_payloads.append(json.loads(json.dumps(gd, default=self._json_serializer)))
+                self.logger.info(f"Queueing {len(groups_payloads)} trajectory groups to send to UI [step {step}]")
+            except Exception as e:
+                self.logger.warning(f"Failed to serialize trajectory groups: {e}")
+
+        # Enqueue for background sending
+        try:
+            self._queue.put((step, metrics_payload, episodes_payloads, groups_payloads), timeout=10)
+        except queue.Full:
+            self.logger.warning("UILogger queue full, dropping log for step %d", step)
+
+    def log_eval_result(self, result) -> None:
+        """Post an EvalResult to the UI backend.
+
+        Args:
+            result: An EvalResult dataclass from rllm.experimental.eval.results
+        """
+        if self.session_id is None:
+            return
+
+        try:
+            payload = {
+                "session_id": self.session_id,
+                "dataset_name": result.dataset_name,
+                "model": result.model,
+                "agent": result.agent,
+                "score": result.score,
+                "total": result.total,
+                "correct": result.correct,
+                "errors": result.errors,
+                "signal_averages": result.signal_averages,
+                "items": [{"idx": item.idx, "reward": item.reward, "is_correct": item.is_correct, "error": item.error, "signals": item.signals} for item in result.items],
+            }
+            payload_json = json.loads(json.dumps(payload, default=self._json_serializer))
+            response = self.client.post("/api/eval-results", json=payload_json)
+            self.logger.info(f"Eval result posted, status: {response.status_code}")
+        except Exception as e:
+            self.logger.warning(f"Failed to send eval result to UI: {e}")
+
+    def _json_serializer(self, obj):
+        """Convert numpy types and other non-JSON types to native Python."""
+        import numpy as np
+
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif hasattr(obj, "__dict__"):
+            return str(obj)
+        else:
+            return str(obj)
+
+    def finish(self, exit_code: int = 0):
+        """Mark the session as complete, restore streams, and close HTTP client.
+
+        Args:
+            exit_code: Process exit code. 0 = completed, non-zero = failed.
+        """
+        if self.session_id is None:
+            return
+
+        # Drain the log queue and stop worker
+        if hasattr(self, "_worker_thread"):
+            self._worker_stop.set()
+            self._queue.put(None)  # sentinel
+            self._worker_thread.join(timeout=30)
+            if self._worker_thread.is_alive():
+                self.logger.warning("UILogger worker thread did not finish within 30s")
+
+        # Stop heartbeat thread
+        self._heartbeat_stop.set()
+
+        try:
+            # Flush and restore stdout/stderr
+            if hasattr(self, "_original_stdout"):
+                sys.stdout.flush()
+                sys.stdout = self._original_stdout
+            if hasattr(self, "_original_stderr"):
+                sys.stderr.flush()
+                sys.stderr = self._original_stderr
+            status = "completed" if exit_code == 0 else "failed"
+            self.client.post(
+                f"/api/sessions/{self.session_id}/complete",
+                json={"status": status, "exit_code": exit_code},
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to complete session: {e}")
+        finally:
+            # Drain the log queue and stop worker
+            if hasattr(self, "_worker_thread"):
+                self._worker_stop.set()
+                self._queue.put(None)  # sentinel
+                self._worker_thread.join(timeout=30)
+                if self._worker_thread.is_alive():
+                    self.logger.warning("UILogger worker thread did not finish within 30s")
+            self.client.close()
 
 
 class ClearMLLogger:
@@ -262,7 +685,9 @@ class ClearMLLogger:
                     iteration=step,
                 )
             else:
-                logger.warning(f'Trainer is attempting to log a value of "{v}" of type {type(v)} for key "{k}". This invocation of ClearML logger\'s function is incorrect so this attribute was dropped. ')
+                logger.warning(
+                    f'Trainer is attempting to log a value of "{v}" of type {type(v)} for key "{k}". This invocation of ClearML logger\'s function is incorrect so this attribute was dropped.'
+                )
 
     def finish(self):
         self._task.close()
