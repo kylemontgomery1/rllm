@@ -186,6 +186,11 @@ class FireworksBackend(TinkerBackend):
             needs_inference=True,
             role_prefix="rllm",
             api_key=api_key,
+            # keep_alive=true prevents server-side reaping of the trainer
+            # during long rollout phases (multi-turn agent rollouts can
+            # exceed 30 min of trainer-idle time, which triggers reaping
+            # without this flag).
+            keep_alive=True,
             cleanup=self._cleanup,
         )
 
