@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
 from typing import TYPE_CHECKING
 
@@ -56,6 +57,7 @@ class FireworksPolicyTrainer:
     """
 
     _METRIC_SKIP_KEYS = {"step_id", "step"}
+    _STEP_CHECKPOINT_RE = re.compile(r"(?:^|/)step-(\d+)$")
 
     def __init__(
         self,
@@ -73,6 +75,8 @@ class FireworksPolicyTrainer:
         self.weight_syncer = weight_syncer
         self._rlor_mgr = rlor_mgr
         self._policy_job_id = policy_job_id
+        self._resume_checkpoint_name = self.config.training.get("resume_from_dcp_checkpoint")
+        self._resume_source_job_id = self.config.training.get("resume_from_fireworks_job_id") or policy_job_id
 
         self.cf_config = cf_config or CompactFilteringConfig.from_config(self.config.rllm.compact_filtering)
         self.transform_config = transform_config or TransformConfig()
@@ -121,24 +125,72 @@ class FireworksPolicyTrainer:
             The step to resume from, or 0 if no checkpoint was found.
         """
         inner = self.training_client.inner
-        checkpoints = inner.list_checkpoints()
-        if not checkpoints:
-            logger.info("No existing checkpoints found.")
-            return 0
+        source_job_id = self._resume_source_job_id
+        checkpoint_name = self._resume_checkpoint_name
 
-        latest_name = checkpoints[-1]
-        logger.info("Resuming from checkpoint: %s", latest_name)
+        if checkpoint_name:
+            spec_source_job_id, checkpoint_name = self._parse_checkpoint_spec(checkpoint_name)
+            source_job_id = spec_source_job_id or source_job_id
+            logger.info(
+                "Resuming from configured DCP checkpoint: %s (source job: %s)",
+                checkpoint_name,
+                source_job_id or self._policy_job_id,
+            )
+        else:
+            checkpoints = self._list_resume_checkpoints(source_job_id)
+            if not checkpoints:
+                logger.info("No existing checkpoints found.")
+                return 0
 
-        checkpoint_ref = inner.resolve_checkpoint_path(latest_name)
-        await asyncio.to_thread(self.training_client.load_state_with_optimizer, checkpoint_ref)
+            checkpoint_name = checkpoints[-1]
+            logger.info("Resuming from latest DCP checkpoint: %s", checkpoint_name)
 
-        try:
-            step = int(latest_name.split("-")[-1])
-        except (ValueError, IndexError):
-            step = 0
+        checkpoint_ref = inner.resolve_checkpoint_path(checkpoint_name, source_job_id=source_job_id)
+        timeout = self.config.hotload.get("dcp_timeout", 2700)
+        await asyncio.to_thread(self.training_client.load_state_with_optimizer, checkpoint_ref, timeout=timeout)
+
+        step = self._parse_checkpoint_step(checkpoint_name)
 
         await self._sync_weights(f"resume-{step}")
         return step
+
+    @staticmethod
+    def _parse_checkpoint_spec(spec: str) -> tuple[str | None, str]:
+        """Parse ``job_id:checkpoint_name`` or a plain checkpoint name."""
+        if ":" in spec and not spec.startswith(("gs://", "/")):
+            source_job_id, checkpoint_name = spec.split(":", 1)
+            return source_job_id, checkpoint_name
+        return None, spec
+
+    def _list_resume_checkpoints(self, source_job_id: str | None) -> list[str]:
+        """List DCP checkpoint names from the source job when available."""
+        if self._rlor_mgr is not None and source_job_id:
+            rows = self._rlor_mgr.list_checkpoints(source_job_id)
+            checkpoints = [
+                (row.get("name") or "").rstrip("/").rsplit("/", 1)[-1]
+                for row in rows
+                if self._is_dcp_checkpoint_row(row)
+            ]
+            return sorted(checkpoints, key=self._parse_checkpoint_step)
+
+        checkpoints = self.training_client.inner.list_checkpoints()
+        if isinstance(checkpoints, tuple):
+            checkpoints = checkpoints[0]
+        return list(checkpoints)
+
+    @staticmethod
+    def _is_dcp_checkpoint_row(row: dict) -> bool:
+        checkpoint_type = row.get("checkpointType") or ""
+        return checkpoint_type.endswith("TRAINING") or checkpoint_type.endswith("TRAINING_LORA")
+
+    @classmethod
+    def _parse_checkpoint_step(cls, checkpoint_name: str) -> int:
+        """Parse integer step from DCP names like ``step-50``."""
+        match = cls._STEP_CHECKPOINT_RE.search(checkpoint_name)
+        if not match:
+            logger.warning("Could not parse step from checkpoint name: %s", checkpoint_name)
+            return 0
+        return int(match.group(1))
 
     async def _initial_weight_sync(self) -> None:
         """Push initial base weights to the inference deployment."""

@@ -603,6 +603,9 @@ class UnifiedTrainer:
             all_backend_datums = []
             all_training_logprobs = []
             groups_consumed = 0
+            successful_fwd_bwd_passes = 0
+            failed_fwd_bwd_passes = 0
+            effective_groups_trained = 0
             buffer_wait_time = 0.0
             done = False
 
@@ -641,9 +644,26 @@ class UnifiedTrainer:
 
                 if trainer_state.has_trajectory_groups:
                     fwd_bwd_start = time.perf_counter()
-                    await self.backend.on_batch_start(trainer_state)
-                    trainer_state.backend_batch = self.backend.transform_to_backend_batch(trainer_state)
-                    await self.backend.process_backend_batch(trainer_state)
+                    try:
+                        await self.backend.on_batch_start(trainer_state)
+                        trainer_state.backend_batch = self.backend.transform_to_backend_batch(trainer_state)
+                        await self.backend.process_backend_batch(trainer_state)
+                    except Exception:
+                        failed_fwd_bwd_passes += 1
+                        trainer_state.backend_batch = []
+                        trainer_state.extra_info.pop("training_logprobs", None)
+                        trainer_state.metrics = {}
+                        logger.exception(
+                            "[TrainingLoop] Step %s: fwd-bwd pass %s/%s failed; skipping %s groups",
+                            trainer_state.global_step,
+                            pass_idx + 1,
+                            num_fwd_bwd_passes,
+                            len(chunk_groups),
+                        )
+                        continue
+
+                    successful_fwd_bwd_passes += 1
+                    effective_groups_trained += len(chunk_groups)
                     fwd_bwd_time = time.perf_counter() - fwd_bwd_start
                     if isinstance(trainer_state.backend_batch, dict):
                         backend_datums = [datum for datums in trainer_state.backend_batch.values() for datum in datums]
@@ -679,6 +699,14 @@ class UnifiedTrainer:
                 logger.info(f"[TrainingLoop] Step {trainer_state.global_step}: incomplete batch ({groups_consumed}/{mini_batch_size}), stopping")
                 break
 
+            if successful_fwd_bwd_passes == 0:
+                logger.warning(
+                    "[TrainingLoop] Step %s: all %s fwd-bwd passes failed; skipping optimizer step",
+                    trainer_state.global_step,
+                    failed_fwd_bwd_passes,
+                )
+                continue
+
             # 2. Optimizer step
             optimizer_start = time.perf_counter()
             await self.backend.update_policy(trainer_state)
@@ -691,6 +719,9 @@ class UnifiedTrainer:
             aggregator.record("async/staleness_min", float(np.min(staleness_values)))
             aggregator.record("async/staleness_max", float(np.max(staleness_values)))
             aggregator.record("async/groups_consumed", groups_consumed)
+            aggregator.record("async/effective_groups_trained", effective_groups_trained)
+            aggregator.record("async/fwd_bwd_passes_successful", successful_fwd_bwd_passes)
+            aggregator.record("async/fwd_bwd_passes_failed", failed_fwd_bwd_passes)
             aggregator.record("time/buffer_wait", buffer_wait_time)
             pre_sync_coordinator_stats = coordinator.stats()
             pre_sync_buffer_stats = buffer.stats()

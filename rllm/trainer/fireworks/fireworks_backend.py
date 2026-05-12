@@ -217,6 +217,7 @@ class FireworksBackend(TinkerBackend):
             rlor_mgr, policy_ep.job_id, cfg.model.name,
             lora_rank=cfg.model.get("lora_rank", 0),
             default_timeout=cfg.training.get("client_timeout", 600),
+            endpoint=policy_ep,
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
