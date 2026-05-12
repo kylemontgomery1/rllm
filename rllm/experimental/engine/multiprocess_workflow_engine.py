@@ -88,8 +88,10 @@ async def _worker_async_main(
 ):
     """Async main loop for a worker process."""
     from rllm.experimental.engine.unified_workflow_engine import UnifiedWorkflowEngine
+    from rllm.utils.logging import configure_logging_from_env
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", force=True)
+    configure_logging_from_env()
 
     # Build rollout engine from config
     rollout_engine = rollout_engine_cls.from_config(rollout_config)

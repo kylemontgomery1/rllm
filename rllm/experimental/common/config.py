@@ -232,6 +232,7 @@ class AlgorithmConfig:
     # Global loss_fn override (for tinker backend; Verl uses loss_fn_map per role)
     loss_fn: Literal["importance_sampling", "ppo", "cispo", "dro", "cross_entropy"] | None = None
     lr_schedule: Literal["linear", "cosine", "constant"] = "constant"
+    warmup_steps: int | None = None
     warmup_steps_ratio: float = 0.0
 
     # Custom loss / rollout correction fields (used by Fireworks backend with cookbook losses)
@@ -263,6 +264,7 @@ class AlgorithmConfig:
             use_precomputed_advantage=algo.get("use_precomputed_advantage", False),
             loss_fn=algo.get("loss_fn", None),
             lr_schedule=algo.get("lr_schedule", "constant"),
+            warmup_steps=algo.get("warmup_steps", None),
             warmup_steps_ratio=algo.get("warmup_steps_ratio", 0.0),
             kl_beta=algo.get("kl_beta", 0.0),
             eps_clip=algo.get("eps_clip", 0.2),

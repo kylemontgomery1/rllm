@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -503,12 +504,12 @@ class UnifiedTrainer:
         # Compute total_steps for LR scheduling
         train_dataloader = self.backend.get_dataloader(self.train_dataset, trainer_state)
         use_total_batches = self.rllm_config.trainer.get("total_batches", -1) > 0
+        total_tasks = len(train_dataloader) * self.rllm_config.trainer.total_epochs
         if use_total_batches:
             trainer_state.total_steps = self.rllm_config.trainer.total_batches
         else:
-            trainer_state.total_steps = len(train_dataloader) * self.rllm_config.trainer.total_epochs
+            trainer_state.total_steps = math.ceil(total_tasks / self.async_config.mini_batch_size)
 
-        total_tasks = len(train_dataloader) * self.rllm_config.trainer.total_epochs
         pbar = tqdm(total=total_tasks, desc="Tasks", unit="task")
         buffer._pbar = pbar
         buffer.set_training_step(trainer_state.global_step)
@@ -547,6 +548,7 @@ class UnifiedTrainer:
 
         try:
             for epoch in range(self.rllm_config.trainer.total_epochs):
+                trainer_state.epoch = epoch
                 await self.backend.on_epoch_start(trainer_state)
                 train_dataloader = self.backend.get_dataloader(self.train_dataset, trainer_state)
                 self.agent_workflow_engine.set_training_step(trainer_state.global_step, mode="train", epoch=epoch)

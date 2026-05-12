@@ -70,6 +70,9 @@ algorithm:
   # tinker: importance_sampling, ppo, cispo, dro
   # null defauls to backend's default
   loss_fn: null
+  lr_schedule: constant   # [constant, linear, cosine]
+  warmup_steps: null      # Absolute optimizer-step warmup; overrides warmup_steps_ratio when set
+  warmup_steps_ratio: 0.0 # Fractional warmup fallback when warmup_steps is null
   loss_agg_mode: null     # [null, token-mean, seq-mean-token-sum, seq-mean-token-mean, seq-mean-token-mean-norm]
   kl_beta: 0.0            # KL penalty coefficient
   eps_clip: 0.2           # PPO clip epsilon

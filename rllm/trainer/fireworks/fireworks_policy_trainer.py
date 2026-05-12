@@ -617,6 +617,7 @@ class FireworksPolicyTrainer:
         """Run optimizer step. Returns (scheduled_lr, metrics)."""
         scheduled_lr = learning_rate * compute_schedule_lr_multiplier(
             lr_schedule=self.algorithm_config.lr_schedule,
+            warmup_steps=self.algorithm_config.warmup_steps,
             warmup_steps_ratio=self.algorithm_config.warmup_steps_ratio,
             step=step,
             total_steps=total_steps,

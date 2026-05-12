@@ -1,4 +1,20 @@
 import logging
+import os
+
+
+def get_log_level_from_env(env_var: str = "RLLM_LOG_LEVEL", default: str = "INFO") -> int:
+    level_name = os.getenv(env_var, default).upper()
+    return getattr(logging, level_name, logging.INFO)
+
+
+def configure_logging_from_env(
+    env_var: str = "RLLM_LOG_LEVEL",
+    default: str = "INFO",
+) -> int:
+    """Set the RLLM logger level from RLLM_LOG_LEVEL."""
+    level = get_log_level_from_env(env_var, default)
+    logging.getLogger("rllm").setLevel(level)
+    return level
 
 
 class DuplicateLoggingFilter(logging.Filter):
