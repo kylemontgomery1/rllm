@@ -390,7 +390,13 @@ async def run_harbor_task(
     exc_type = result.exception_info.exception_type if result.exception_info else None
     trial_uri = getattr(result, "trial_uri", None)
 
-    if reward is not None:
+    # Agent crashes (exceptions not in the graceful-termination map, e.g.
+    # NonZeroAgentExitCodeError) are infra failures, not training signal.
+    # Force ERROR even if the verifier produced a reward, otherwise these get
+    # bucketed as env_done and pull down group-relative advantages.
+    is_agent_crash = exc_type is not None and exc_type not in _get_exception_type_map()
+
+    if reward is not None and not is_agent_crash:
         return HarborTaskOutcome(
             finished=True,
             reward=reward,
@@ -403,7 +409,7 @@ async def run_harbor_task(
             _trial_result=result,
         )
 
-    # No reward signal → finished=False.
+    # No reward signal, or agent crashed → finished=False.
     return HarborTaskOutcome(
         finished=False,
         reward=None,
