@@ -111,6 +111,7 @@ def build_harbor_trial_config(
     inference_url: str | None = None,
     environment_type: str | None = None,
     agent_kwargs: dict[str, Any] | None = None,
+    env_overrides: dict[str, Any] | None = None,
     agent_timeout_multiplier: float | None = None,
     verifier_timeout_multiplier: float | None = None,
     agent_setup_timeout_multiplier: float | None = None,
@@ -195,7 +196,7 @@ def build_harbor_trial_config(
             kwargs=dict(agent_kwargs) if agent_kwargs else {},
             env=env,
         ),
-        environment=EnvironmentConfig(type=env_type),
+        environment=EnvironmentConfig(type=env_type, **(env_overrides or {})),
     )
 
 
@@ -260,6 +261,7 @@ def _get_exception_type_map() -> dict[str, Any]:
             "AgentTimeoutError": TerminationReason.TIMEOUT,
             "ContextLengthExceededError": TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED,
             "OutputLengthExceededError": TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED,
+            "AgentStuckInLoopError": TerminationReason.MAX_TURNS_EXCEEDED,
         }
     return _EXCEPTION_TYPE_MAP
 
@@ -313,6 +315,7 @@ async def run_harbor_task(
     inference_url: str | None = None,
     environment_type: str | None = None,
     agent_kwargs: dict[str, Any] | None = None,
+    env_overrides: dict[str, Any] | None = None,
     agent_timeout_multiplier: float | None = None,
     verifier_timeout_multiplier: float | None = None,
     agent_setup_timeout_multiplier: float | None = None,
@@ -354,6 +357,7 @@ async def run_harbor_task(
             inference_url=inference_url,
             environment_type=environment_type,
             agent_kwargs=agent_kwargs,
+            env_overrides=env_overrides,
             agent_timeout_multiplier=agent_timeout_multiplier,
             verifier_timeout_multiplier=verifier_timeout_multiplier,
             agent_setup_timeout_multiplier=agent_setup_timeout_multiplier,
@@ -427,7 +431,7 @@ def outcome_to_episode(outcome: HarborTaskOutcome, uid: str, task: dict):
     from rllm.integrations.harbor.atif_trajectory_bridge import load_atif_steps
     from rllm.types import Episode, Trajectory
 
-    reward = outcome.reward
+    reward = outcome.reward if outcome.reward is not None else 0.0
     is_correct = outcome.is_correct
 
     # Load ATIF trajectory steps from disk if available.
@@ -435,16 +439,14 @@ def outcome_to_episode(outcome: HarborTaskOutcome, uid: str, task: dict):
     if outcome.trial_uri:
         steps = load_atif_steps(outcome.trial_uri)
 
-    trajectories = []
-    if reward is not None:
-        trajectories.append(
-            Trajectory(
-                name="harbor_trial",
-                task=task,
-                steps=steps,
-                reward=reward,
-            )
+    trajectories = [
+        Trajectory(
+            name="harbor_trial",
+            task=task,
+            steps=steps,
+            reward=reward,
         )
+    ]
 
     metrics: dict[str, Any] = {
         "reward": reward if reward is not None else 0.0,

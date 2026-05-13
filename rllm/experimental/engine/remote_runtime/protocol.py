@@ -91,6 +91,9 @@ class HarborRuntimeConfig:
     environment_type: str | None = None
     # Pass-through to harbor AgentConfig.kwargs (scaffold-specific flags).
     agent_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Pass-through to harbor EnvironmentConfig overrides: override_cpus, override_memory_mb,
+    # override_storage_mb, override_gpus. Force a resource value regardless of task.toml.
+    env_overrides: dict[str, Any] = field(default_factory=dict)
     # Per-stage timeout multipliers — None means use the task's default (multiplier 1.0).
     agent_timeout_multiplier: float | None = None
     verifier_timeout_multiplier: float | None = None

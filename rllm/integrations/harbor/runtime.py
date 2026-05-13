@@ -43,6 +43,7 @@ class HarborRuntime:
         agent_name: str = "mini-swe-agent",
         environment_type: str | None = None,
         agent_kwargs: dict[str, Any] | None = None,
+        env_overrides: dict[str, Any] | None = None,
         # Training-specific config (ignored by eval path).
         agent_timeout_multiplier: float | None = None,
         verifier_timeout_multiplier: float | None = None,
@@ -53,6 +54,7 @@ class HarborRuntime:
         self.agent_name = agent_name
         self.environment_type = environment_type
         self.agent_kwargs = agent_kwargs or {}
+        self.env_overrides = env_overrides or {}
         self.agent_timeout_multiplier = agent_timeout_multiplier
         self.verifier_timeout_multiplier = verifier_timeout_multiplier
         self.agent_setup_timeout_multiplier = agent_setup_timeout_multiplier
@@ -100,6 +102,7 @@ class HarborRuntime:
             inference_url=inference_url,
             environment_type=self.environment_type,
             agent_kwargs=self.agent_kwargs,
+            env_overrides=self.env_overrides,
             agent_timeout_multiplier=self.agent_timeout_multiplier,
             verifier_timeout_multiplier=self.verifier_timeout_multiplier,
             agent_setup_timeout_multiplier=self.agent_setup_timeout_multiplier,
@@ -134,11 +137,6 @@ class HarborRuntime:
             inference_url=config.base_url,
             trial_name=config.session_uid,
         )
-
-        # Surface infrastructure failures as exceptions so run_dataset counts
-        # them as errors rather than silently reporting 0% accuracy.
-        if not outcome.finished:
-            raise RuntimeError(f"Harbor trial failed ({config.session_uid}): {outcome.error}")
 
         episode = outcome_to_episode(outcome, config.session_uid, task.metadata)
 

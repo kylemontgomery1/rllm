@@ -41,6 +41,7 @@ def create_remote_runtime(
             agent_name=h.agent,
             environment_type=h.environment_type,
             agent_kwargs=dict(h.agent_kwargs),
+            env_overrides=dict(h.env_overrides),
             agent_timeout_multiplier=h.agent_timeout_multiplier,
             verifier_timeout_multiplier=h.verifier_timeout_multiplier,
             agent_setup_timeout_multiplier=h.agent_setup_timeout_multiplier,

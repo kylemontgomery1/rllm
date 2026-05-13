@@ -129,6 +129,7 @@ remote_runtime:
     agent: mini-swe-agent       # scaffold name (mini-swe-agent | aider | openhands | swe-agent | qwen-coder | ...)
     environment_type: docker    # docker | modal | daytona | e2b | runloop | gke | apple-container
     agent_kwargs: {}            # pass-through to harbor's AgentConfig.kwargs (scaffold-specific flags)
+    env_overrides: {}           # pass-through to harbor's EnvironmentConfig (override_cpus, override_memory_mb, override_storage_mb, override_gpus)
     agent_timeout_multiplier: null
     verifier_timeout_multiplier: null
     agent_setup_timeout_multiplier: null
