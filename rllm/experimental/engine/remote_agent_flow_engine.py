@@ -131,8 +131,13 @@ class RemoteAgentFlowEngine:
             if not result.finished:
                 episode.metadata["error"] = {"message": result.error or "Unknown error"}
 
-            # Delete traces from gateway DB to prevent unbounded growth
-            await self.gateway.adelete_session(session_id)
+            # Delete traces from gateway DB to prevent unbounded growth.
+            # Best-effort: a transient gateway error here must not kill the
+            # whole run when the episode is already built.
+            try:
+                await self.gateway.adelete_session(session_id)
+            except Exception as e:
+                logger.warning("adelete_session failed for %s: %s (continuing)", session_id, e)
 
             return task_id, rollout_idx, result_idx, episode
 

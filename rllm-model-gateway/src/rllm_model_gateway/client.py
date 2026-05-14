@@ -146,7 +146,10 @@ class AsyncGatewayClient:
         timeout: float = 30.0,
     ) -> None:
         self.gateway_url = gateway_url.rstrip("/")
-        self._http = httpx.AsyncClient(timeout=timeout)
+        # max_keepalive_connections=0 forces a fresh TCP connection per request,
+        # eliminating stale pooled sockets dropped by uvicorn's keep-alive timeout
+        # during long idle windows between admin calls.
+        self._http = httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_keepalive_connections=0))
 
     async def close(self) -> None:
         await self._http.aclose()
