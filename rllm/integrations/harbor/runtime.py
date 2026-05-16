@@ -136,6 +136,7 @@ class HarborRuntime:
             model_name=config.model,
             inference_url=config.base_url,
             trial_name=config.session_uid,
+            timeout=self.session_timeout,
         )
 
         episode = outcome_to_episode(outcome, config.session_uid, task.metadata)

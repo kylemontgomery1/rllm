@@ -156,6 +156,7 @@ def build_harbor_trial_config(
         model_name = _infer_provider_prefix(model_name)
 
     env: dict[str, str] = {}
+    agent_kwargs = dict(agent_kwargs) if agent_kwargs else {}
     if inference_url:
         # Rewrite localhost URLs to host.docker.internal so the agent
         # inside a Docker container can reach the host's proxy/gateway.
@@ -171,6 +172,11 @@ def build_harbor_trial_config(
         env["OPENAI_BASE_URL"] = container_url
         env["LLM_BASE_URL"] = container_url
         env["ANTHROPIC_BASE_URL"] = container_url
+
+        # In-process agents (e.g. terminus-2) read api_base from constructor
+        # kwargs, not env vars, and run on the host — so use the raw URL,
+        # not the container-rewritten one.
+        agent_kwargs.setdefault("api_base", inference_url)
 
     env_type = None
     if environment_type:
@@ -193,7 +199,7 @@ def build_harbor_trial_config(
         agent=AgentConfig(
             name=agent_name,
             model_name=model_name or MODEL_PLACEHOLDER,
-            kwargs=dict(agent_kwargs) if agent_kwargs else {},
+            kwargs=agent_kwargs,
             env=env,
         ),
         environment=EnvironmentConfig(type=env_type, **(env_overrides or {})),
