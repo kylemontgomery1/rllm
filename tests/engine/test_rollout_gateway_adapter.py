@@ -21,6 +21,7 @@ class FakeRolloutEngine:
             prompt_ids=[10, 11, 12],
             completion_ids=[20, 21],
             logprobs=[-0.1, -0.2],
+            routing_matrices=["rm-20", "rm-21"],
             finish_reason="stop",
         )
 
@@ -58,7 +59,11 @@ def test_rollout_handler_maps_gateway_request_and_token_extensions():
 
     choice = response["choices"][0]
     assert choice["token_ids"] == [20, 21]
-    assert choice["logprobs"]["content"] == [{"logprob": -0.1}, {"logprob": -0.2}]
+    assert choice["routing_matrices"] == ["rm-20", "rm-21"]
+    assert choice["logprobs"]["content"] == [
+        {"logprob": -0.1, "routing_matrix": "rm-20"},
+        {"logprob": -0.2, "routing_matrix": "rm-21"},
+    ]
     assert choice["finish_reason"] == "tool_calls"
     assert choice["message"]["content"] == "The answer is 4."
     assert choice["message"]["reasoning"] == "I added the numbers."

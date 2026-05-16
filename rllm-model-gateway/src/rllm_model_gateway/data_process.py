@@ -54,6 +54,31 @@ def extract_logprobs(response: dict[str, Any]) -> list[float]:
     return [float(entry["logprob"]) for entry in content if entry and entry.get("logprob") is not None]
 
 
+def extract_routing_matrices(response: dict[str, Any]) -> list[str]:
+    """Extract per-completion-token router replay payloads from a response."""
+    choices = response.get("choices")
+    if not choices:
+        return []
+
+    choice = choices[0]
+    matrices = choice.get("routing_matrices")
+    if isinstance(matrices, list):
+        return list(matrices)
+
+    lp_obj = choice.get("logprobs")
+    if lp_obj is None:
+        return []
+    content = lp_obj.get("content")
+    if not content:
+        return []
+    if not any(isinstance(entry, dict) and "routing_matrix" in entry for entry in content):
+        return []
+    return [
+        (entry.get("routing_matrix") or "") if isinstance(entry, dict) else ""
+        for entry in content
+    ]
+
+
 # ------------------------------------------------------------------
 # Streaming accumulation helpers
 # ------------------------------------------------------------------
@@ -89,6 +114,11 @@ def extract_delta_logprobs(chunk: dict[str, Any]) -> list[float]:
     return [float(e["logprob"]) for e in content if e and e.get("logprob") is not None]
 
 
+def extract_delta_routing_matrices(chunk: dict[str, Any]) -> list[str]:
+    """Extract router replay payloads from one streaming chunk."""
+    return extract_routing_matrices(chunk)
+
+
 # ------------------------------------------------------------------
 # Response sanitisation
 # ------------------------------------------------------------------
@@ -105,8 +135,26 @@ _VLLM_CHOICE_FIELDS = frozenset(
     {
         "token_ids",
         "stop_reason",
+        "routing_matrices",
     }
 )
+
+
+def _strip_routing_matrix_from_logprobs(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    content = value.get("content")
+    if not isinstance(content, list):
+        return value
+    return {
+        **value,
+        "content": [
+            {k: v for k, v in entry.items() if k != "routing_matrix"}
+            if isinstance(entry, dict)
+            else entry
+            for entry in content
+        ],
+    }
 
 
 def strip_vllm_fields(response: dict[str, Any]) -> dict[str, Any]:
@@ -118,7 +166,13 @@ def strip_vllm_fields(response: dict[str, Any]) -> dict[str, Any]:
     """
     sanitized = {k: v for k, v in response.items() if k not in _VLLM_ROOT_FIELDS}
     if "choices" in sanitized:
-        sanitized["choices"] = [{k: v for k, v in choice.items() if k not in _VLLM_CHOICE_FIELDS} for choice in sanitized["choices"]]
+        choices = sanitized["choices"]
+        sanitized["choices"] = []
+        for choice in choices:
+            clean_choice = {k: v for k, v in choice.items() if k not in _VLLM_CHOICE_FIELDS}
+            if "logprobs" in clean_choice:
+                clean_choice["logprobs"] = _strip_routing_matrix_from_logprobs(clean_choice["logprobs"])
+            sanitized["choices"].append(clean_choice)
     return sanitized
 
 
@@ -155,6 +209,7 @@ def build_trace_record(
         response_message=first_choice.get("message") or first_choice.get("delta") or {},
         completion_token_ids=extract_completion_token_ids(response_body),
         logprobs=extract_logprobs(response_body) or None,
+        routing_matrices=extract_routing_matrices(response_body) or None,
         finish_reason=first_choice.get("finish_reason"),
         latency_ms=latency_ms,
         token_counts=token_counts,
@@ -183,6 +238,7 @@ def build_trace_record_from_chunks(
     prompt_ids: list[int] = []
     completion_ids: list[int] = []
     logprobs: list[float] = []
+    routing_matrices: list[str] = []
     role = ""
     content_parts: list[str] = []
     tool_calls_parts: list[dict[str, Any]] = []
@@ -200,6 +256,9 @@ def build_trace_record_from_chunks(
 
         delta_lp = extract_delta_logprobs(chunk)
         logprobs.extend(delta_lp)
+
+        delta_routing = extract_delta_routing_matrices(chunk)
+        routing_matrices.extend(delta_routing)
 
         choices = chunk.get("choices", [])
         if choices:
@@ -239,6 +298,7 @@ def build_trace_record_from_chunks(
         response_message=response_message,
         completion_token_ids=completion_ids,
         logprobs=logprobs or None,
+        routing_matrices=routing_matrices or None,
         finish_reason=finish_reason,
         latency_ms=latency_ms,
         token_counts=token_counts,

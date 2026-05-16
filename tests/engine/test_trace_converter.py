@@ -95,6 +95,7 @@ class TestTraceRecordToStep:
             },
             "completion_token_ids": [10, 11],
             "logprobs": [-0.5, -0.3],
+            "routing_matrices": ["rm-10", "rm-11"],
             "finish_reason": "stop",
         }
         defaults.update(overrides)
@@ -110,6 +111,8 @@ class TestTraceRecordToStep:
         assert step.model_output.prompt_ids == [1, 2, 3]
         assert step.model_output.completion_ids == [10, 11]
         assert step.model_output.logprobs == [-0.5, -0.3]
+        assert step.model_output.routing_matrices == ["rm-10", "rm-11"]
+        assert step.routing_matrices == ["rm-10", "rm-11"]
         assert step.model_output.tool_calls is None
 
     def test_step_with_tool_calls(self):

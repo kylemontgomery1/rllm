@@ -75,7 +75,19 @@ def create_rollout_handler(engine: RolloutEngine) -> Callable[[dict[str, Any]], 
         prompt_ids = list(model_output.prompt_ids) if model_output.prompt_ids else []
         completion_ids = list(model_output.completion_ids) if model_output.completion_ids else []
         logprobs = model_output.logprobs or []
+        routing_matrices = getattr(model_output, "routing_matrices", None) or []
         finish_reason = model_output.finish_reason or "stop"
+
+        if routing_matrices and len(routing_matrices) != len(completion_ids):
+            raise RuntimeError(
+                f"routing_matrices length mismatch: {len(routing_matrices)} matrices vs "
+                f"{len(completion_ids)} completion tokens"
+            )
+
+        logprob_content = [{"logprob": lp} for lp in logprobs]
+        if routing_matrices:
+            for entry, routing_matrix in zip(logprob_content, routing_matrices, strict=False):
+                entry["routing_matrix"] = routing_matrix
 
         response_message: dict[str, Any] = {"role": "assistant", "content": response_text}
         if model_output.reasoning:
@@ -88,22 +100,24 @@ def create_rollout_handler(engine: RolloutEngine) -> Callable[[dict[str, Any]], 
         prompt_len = model_output.prompt_length or len(prompt_ids)
         completion_len = model_output.completion_length or len(completion_ids)
 
+        choice: dict[str, Any] = {
+            "index": 0,
+            "message": response_message,
+            "finish_reason": finish_reason,
+            "token_ids": completion_ids,
+            "logprobs": {
+                "content": logprob_content,
+            },
+        }
+        if routing_matrices:
+            choice["routing_matrices"] = list(routing_matrices)
+
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": request_body.get("model", getattr(engine, "model_name", "default")),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": response_message,
-                    "finish_reason": finish_reason,
-                    "token_ids": completion_ids,
-                    "logprobs": {
-                        "content": [{"logprob": lp} for lp in logprobs],
-                    },
-                }
-            ],
+            "choices": [choice],
             "usage": {
                 "prompt_tokens": prompt_len,
                 "completion_tokens": completion_len,

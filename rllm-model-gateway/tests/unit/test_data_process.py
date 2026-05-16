@@ -5,9 +5,11 @@ from rllm_model_gateway.data_process import (
     build_trace_record_from_chunks,
     extract_completion_token_ids,
     extract_delta_logprobs,
+    extract_delta_routing_matrices,
     extract_delta_token_ids,
     extract_logprobs,
     extract_prompt_token_ids,
+    extract_routing_matrices,
     strip_vllm_fields,
 )
 
@@ -63,6 +65,30 @@ class TestExtractLogprobs:
         assert extract_logprobs({}) == []
 
 
+class TestExtractRoutingMatrices:
+    def test_from_choice_field(self):
+        resp = {"choices": [{"routing_matrices": ["rm-1", "rm-2"]}]}
+        assert extract_routing_matrices(resp) == ["rm-1", "rm-2"]
+
+    def test_from_logprobs_content(self):
+        resp = {
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {"token": "Hi", "logprob": -0.5, "routing_matrix": "rm-1"},
+                            {"token": " there", "logprob": -0.3, "routing_matrix": "rm-2"},
+                        ]
+                    }
+                }
+            ]
+        }
+        assert extract_routing_matrices(resp) == ["rm-1", "rm-2"]
+
+    def test_no_routing_matrices(self):
+        assert extract_routing_matrices({"choices": [{"logprobs": {"content": [{"logprob": -0.1}]}}]}) == []
+
+
 class TestExtractDeltaTokenIds:
     def test_from_direct_token_ids(self):
         """vLLM 0.11+ format: token_ids directly in choice."""
@@ -93,6 +119,12 @@ class TestExtractDeltaLogprobs:
         assert extract_delta_logprobs({"choices": [{}]}) == []
 
 
+class TestExtractDeltaRoutingMatrices:
+    def test_from_chunk(self):
+        chunk = {"choices": [{"routing_matrices": ["rm-1"]}]}
+        assert extract_delta_routing_matrices(chunk) == ["rm-1"]
+
+
 # ------------------------------------------------------------------
 # Response sanitisation
 # ------------------------------------------------------------------
@@ -118,6 +150,7 @@ class TestStripVllmFields:
                     "message": {"role": "assistant", "content": "hi"},
                     "token_ids": [10, 11],
                     "stop_reason": None,
+                    "routing_matrices": ["rm-1", "rm-2"],
                 }
             ]
         }
@@ -125,7 +158,27 @@ class TestStripVllmFields:
         choice = sanitized["choices"][0]
         assert "token_ids" not in choice
         assert "stop_reason" not in choice
+        assert "routing_matrices" not in choice
         assert choice["message"]["content"] == "hi"
+
+    def test_strips_routing_matrix_from_logprobs(self):
+        resp = {
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {"token": "a", "logprob": -0.1, "routing_matrix": "rm-a"},
+                            {"token": "b", "logprob": -0.2, "routing_matrix": "rm-b"},
+                        ]
+                    }
+                }
+            ]
+        }
+        sanitized = strip_vllm_fields(resp)
+        assert sanitized["choices"][0]["logprobs"]["content"] == [
+            {"token": "a", "logprob": -0.1},
+            {"token": "b", "logprob": -0.2},
+        ]
 
     def test_preserves_other_fields(self):
         resp = {"id": "123", "model": "m", "choices": []}
@@ -156,8 +209,8 @@ class TestBuildTraceRecord:
                     "token_ids": [10, 11],
                     "logprobs": {
                         "content": [
-                            {"token": "hi", "logprob": -0.5, "bytes": None, "top_logprobs": []},
-                            {"token": "!", "logprob": -0.1, "bytes": None, "top_logprobs": []},
+                            {"token": "hi", "logprob": -0.5, "bytes": None, "top_logprobs": [], "routing_matrix": "rm-10"},
+                            {"token": "!", "logprob": -0.1, "bytes": None, "top_logprobs": [], "routing_matrix": "rm-11"},
                         ]
                     },
                 }
@@ -171,6 +224,7 @@ class TestBuildTraceRecord:
         assert trace.prompt_token_ids == [1, 2, 3]
         assert trace.completion_token_ids == [10, 11]
         assert trace.logprobs == [-0.5, -0.1]
+        assert trace.routing_matrices == ["rm-10", "rm-11"]
         assert trace.finish_reason == "stop"
         assert trace.token_counts == {"prompt": 3, "completion": 2}
         assert trace.messages == [{"role": "user", "content": "hello"}]
@@ -202,7 +256,7 @@ class TestBuildTraceRecord:
                         "index": 0,
                         "delta": {"content": "Hi"},
                         "token_ids": [10],
-                        "logprobs": {"content": [{"token": "Hi", "logprob": -0.5}]},
+                        "logprobs": {"content": [{"token": "Hi", "logprob": -0.5, "routing_matrix": "rm-10"}]},
                         "finish_reason": None,
                     }
                 ]
@@ -213,7 +267,7 @@ class TestBuildTraceRecord:
                         "index": 0,
                         "delta": {"content": " there"},
                         "token_ids": [11],
-                        "logprobs": {"content": [{"token": " there", "logprob": -0.3}]},
+                        "logprobs": {"content": [{"token": " there", "logprob": -0.3, "routing_matrix": "rm-11"}]},
                         "finish_reason": None,
                     }
                 ]
@@ -229,6 +283,7 @@ class TestBuildTraceRecord:
         assert trace.prompt_token_ids == [1, 2, 3]
         assert trace.completion_token_ids == [10, 11]
         assert trace.logprobs == [-0.5, -0.3]
+        assert trace.routing_matrices == ["rm-10", "rm-11"]
         assert trace.response_message["content"] == "Hi there"
         assert trace.finish_reason == "stop"
         assert trace.token_counts == {"prompt": 3, "completion": 2}
