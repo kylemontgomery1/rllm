@@ -337,7 +337,7 @@ class TrajectoryGroupBuffer:
             for k, v in ep.metrics.items():
                 try:
                     metric_key = f"episode/{k}"
-                    rule = "mean" if metric_key.startswith("episode/tool_calls/") else None
+                    rule = "mean" if metric_key.startswith(("episode/tool_calls/", "episode/format_retries/", "episode/judge/")) else None
                     self._aggregator.record(metric_key, float(v), rule=rule)
                 except (TypeError, ValueError):
                     continue

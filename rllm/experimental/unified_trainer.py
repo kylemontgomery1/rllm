@@ -285,6 +285,20 @@ class UnifiedTrainer:
             )
             self.episode_logger = EpisodeLogger(base_dir=episode_log_dir, subdirectory="episodes")
 
+        self.compact_rollout_logger = None
+        if self.rllm_config.episode_logging.get("log_compact_rollouts", False):
+            compact_rollout_dir = self.rllm_config.episode_logging.get(
+                "compact_rollout_dir",
+                f"logs/{self.rllm_config.trainer.project_name}/{self.rllm_config.trainer.experiment_name}/compact_rollouts",
+            )
+            try:
+                from rllm.utils.compact_rollout_logger import CompactRolloutLogger
+
+                self.compact_rollout_logger = CompactRolloutLogger(compact_rollout_dir)
+            except Exception as e:
+                logger.warning("Failed to initialize compact rollout logger at %s: %s", compact_rollout_dir, e)
+                self.compact_rollout_logger = None
+
         source_metadata = extract_source_metadata(
             workflow_class=self.workflow_class,
             workflow_args=self.workflow_args,
@@ -419,6 +433,12 @@ class UnifiedTrainer:
         # TODO(kylemontgomery1): episode generation should be backend-agnostic
         # stage 1: generate episodes (async) and collect metrics (sync)
         trainer_state.episodes = await self.backend.generate_episodes(batch, agent_workflow_engine=self.agent_workflow_engine, is_validation=False)
+        self._log_compact_episodes(
+            trainer_state.episodes,
+            step=trainer_state.global_step,
+            mode="train",
+            epoch=trainer_state.epoch,
+        )
         if not trainer_state.has_episodes:
             return
 
@@ -563,11 +583,19 @@ class UnifiedTrainer:
                         await coordinator.wait_for_throttle()
                     coordinator.on_group_dispatched()
 
+                    log_step = trainer_state.global_step
+                    log_epoch = epoch
                     task_id = str(uuid.uuid4())
                     for rollout_idx in range(group_size):
 
-                        async def _run_rollout(t=task, tid=task_id, ridx=rollout_idx):
+                        async def _run_rollout(t=task, tid=task_id, ridx=rollout_idx, step=log_step, ep=log_epoch):
                             _, _, _, episode = await self.agent_workflow_engine.process_task_with_retry(task=t, task_id=tid, rollout_idx=ridx, result_idx=0)
+                            self._log_compact_episode(
+                                episode,
+                                step=step,
+                                mode="train",
+                                epoch=ep,
+                            )
                             await buffer.add_episode(tid, episode)
 
                         t = asyncio.create_task(_run_rollout())
@@ -849,6 +877,12 @@ class UnifiedTrainer:
         for batch in val_dataloader:
             # Generate episodes and transform to trajectory groups
             val_episodes = await self.backend.generate_episodes(batch, agent_workflow_engine=self.agent_workflow_engine, is_validation=True)
+            self._log_compact_episodes(
+                val_episodes,
+                step=trainer_state.global_step,
+                mode="val",
+                epoch=trainer_state.epoch,
+            )
             val_trajectory_groups, _ = transform_episodes_to_trajectory_groups(val_episodes, self.transform_config, self.cf_config, traj_grouping_hook=self.traj_grouping_hook)
             reward_metrics = collect_reward_and_advantage_from_trajectory_groups(val_trajectory_groups, self.algorithm_config, collect_advantage=False)
 
@@ -916,6 +950,25 @@ class UnifiedTrainer:
     # =========================================================================
     # Helper functions
     # =========================================================================
+    def _log_compact_episode(self, episode: Episode, step: int, mode: str = "train", epoch: int = 0) -> None:
+        if self.compact_rollout_logger is None:
+            return
+        if episode is None:
+            return
+        try:
+            self.compact_rollout_logger.log_episode(episode, step=step, mode=mode, epoch=epoch)
+        except Exception as e:
+            logger.warning("Failed to compact-log episode %s: %s", getattr(episode, "id", "<unknown>"), e)
+
+    def _log_compact_episodes(self, episodes: list[Episode] | None, step: int, mode: str = "train", epoch: int = 0) -> None:
+        if episodes is None:
+            return
+        try:
+            for episode in episodes:
+                self._log_compact_episode(episode, step=step, mode=mode, epoch=epoch)
+        except Exception as e:
+            logger.warning("Failed to compact-log episode batch: %s", e)
+
     def _record_backend_metrics(self, aggregator: MetricsAggregator, metrics: dict) -> None:
         active_tokens = float(metrics.get("train/active_tokens", metrics.get("train/num_loss_tokens", 0.0)) or 0.0)
         response_tokens = active_tokens

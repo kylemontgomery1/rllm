@@ -205,3 +205,5 @@ async_training:
 episode_logging:
   log_episodes: false
   episode_log_dir: logs/${rllm.trainer.project_name}/${rllm.trainer.experiment_name}
+  log_compact_rollouts: false
+  compact_rollout_dir: logs/${rllm.trainer.project_name}/${rllm.trainer.experiment_name}/compact_rollouts
