@@ -39,8 +39,8 @@ dependencies = [
     "aiosqlite",
     "hydra-core",
     "codetiming",
-    "tinker ; python_version >= '3.11'",
-    "tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git#egg=tinker-cookbook ; python_version >= '3.11'",
+    "tinker==0.16.1 ; python_version >= '3.11'",
+    "tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@d7fb423674c0bdd27c20a9b948b6091457874039 ; python_version >= '3.11'",
 ]
 
 [project.scripts]
@@ -91,13 +91,13 @@ verl = [
 ]
 
 tinker = [
-    "tinker ; python_version >= '3.11'",
-    "tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git#egg=tinker-cookbook ; python_version >= '3.11'",
+    "tinker==0.16.1 ; python_version >= '3.11'",
+    "tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@d7fb423674c0bdd27c20a9b948b6091457874039 ; python_version >= '3.11'",
 ]
 
 fireworks = [
-    "fireworks-ai[training] ; python_version >= '3.11'",
-    "fireworks-training-cookbook @ git+https://github.com/fw-ai/cookbook.git#subdirectory=training ; python_version >= '3.11'",
+    "fireworks-ai[training]==1.2.0a65 ; python_version >= '3.11'",
+    "fireworks-training-cookbook @ git+https://github.com/fw-ai/cookbook.git@7163b526444da815e78c805b6c3a47ea20bb6872#subdirectory=training ; python_version >= '3.11'",
 ]
 
 opentelemetry = [
@@ -150,6 +150,8 @@ override-dependencies = [
     "litellm[proxy]==1.83.0",
     "numpy>=1.26.0",
     "rich>=14.1.0",
+    "tinker==0.16.1 ; python_version >= '3.11'",
+    "tinker-cookbook @ git+https://github.com/thinking-machines-lab/tinker-cookbook.git@d7fb423674c0bdd27c20a9b948b6091457874039 ; python_version >= '3.11'",
 ]
 
 [tool.uv.extra-build-dependencies]

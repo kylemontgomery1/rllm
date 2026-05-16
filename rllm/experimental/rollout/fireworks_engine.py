@@ -236,9 +236,16 @@ class FireworksEngine(TinkerEngine):
                 prompt_ids.extend(elem.tokens)
 
         sampling_params = self.val_sampling_params.copy() if self.is_validation else self.train_sampling_params.copy()
-        requested_max_tokens = kwargs.pop("max_tokens", kwargs.pop("max_new_tokens", self.max_response_length))
-        requested_max_tokens = sampling_params.pop("max_tokens", requested_max_tokens)
-        max_tokens = self._prepare_max_tokens(requested_max_tokens, input_length)
+        # SWE Fireworks rollouts use a single context budget. Ignore request-
+        # or session-level completion caps so each call receives all remaining
+        # context after the prompt, preserving the one-token engine reserve.
+        kwargs.pop("max_tokens", None)
+        kwargs.pop("max_new_tokens", None)
+        sampling_params.pop("max_tokens", None)
+        sampling_params.pop("max_new_tokens", None)
+        max_tokens = self.max_model_length - len(prompt_ids)
+        if max_tokens <= 0:
+            raise TerminationEvent(TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
 
         for key in ("temperature", "top_p", "top_k", "user"):
             if key in kwargs:
