@@ -184,7 +184,8 @@ def transform_trajectory_groups_to_datums(
     for group in trajectory_groups:
         for trajectory in group.trajectories:
             total_agent_steps += len(trajectory.steps)
-            traj_datums = trajectory_to_datums(trajectory, router_replay=(algorithm_config.router_replay == "R3"))
+            router_replay_enabled = algorithm_config.router_replay is True or algorithm_config.router_replay == "R3"
+            traj_datums = trajectory_to_datums(trajectory, router_replay=router_replay_enabled)
             steps_per_traj.append(len(traj_datums))
             for d in traj_datums:
                 mask_data = d.loss_fn_inputs["mask"].data

@@ -65,6 +65,7 @@ class CompactFilteringConfig:
     mask_timeout: bool = False
     mask_unknown: bool = False
     mask_error: bool = False
+    mask_format_error: bool = False
 
     @classmethod
     def from_config(cls, config: DictConfig) -> "CompactFilteringConfig":
@@ -95,6 +96,7 @@ class CompactFilteringConfig:
             or (self.mask_timeout and termination_reason == TerminationReason.TIMEOUT)
             or (self.mask_unknown and termination_reason == TerminationReason.UNKNOWN)
             or (self.mask_error and termination_reason == TerminationReason.ERROR)
+            or (self.mask_format_error and termination_reason == TerminationReason.FORMAT_ERROR)
         )
 
 
@@ -173,6 +175,10 @@ class RolloutCorrectionConfig:
     tis_mode: str | None = None
     bypass_mode: bool | None = None
     tis_cap: float = 5.0
+    rs_mode: str | None = None
+    rs_threshold: str | float | None = None
+    icepop_mode: str | None = None
+    icepop_beta: float = 2.0
 
 
 class rLLMAdvantageEstimator(str, Enum):
@@ -222,6 +228,7 @@ class AlgorithmConfig:
     # Global loss function (backend-specific values; null = backend default)
     loss_fn: str | None = None
     lr_schedule: Literal["linear", "cosine", "constant"] = "constant"
+    warmup_steps: int | None = None
     warmup_steps_ratio: float = 0.0
 
     # Custom loss / rollout correction fields (used by Fireworks backend with cookbook losses)
@@ -230,7 +237,7 @@ class AlgorithmConfig:
     eps_clip_high: float | None = None
     loss_agg_mode: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", None] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
-    router_replay: Literal["disabled", "R2", "R3"] = "disabled"
+    router_replay: bool | Literal["disabled", "R2", "R3"] = "disabled"
 
     @classmethod
     def from_config(cls, algorithm_config: DictConfig, *, stepwise_advantage_mode: str = "broadcast", estimator_map: dict | None = None) -> "AlgorithmConfig":
@@ -255,6 +262,10 @@ class AlgorithmConfig:
             tis_mode=rc_section.get("tis_mode", None),
             bypass_mode=rc_section.get("bypass_mode", None),
             tis_cap=rc_section.get("tis_cap", 2.0),
+            rs_mode=rc_section.get("rs_mode", None),
+            rs_threshold=rc_section.get("rs_threshold", None),
+            icepop_mode=rc_section.get("icepop_mode", None),
+            icepop_beta=rc_section.get("icepop_beta", 2.0),
         )
         return cls(
             estimator=rLLMAdvantageEstimator(algorithm_config.adv_estimator),
@@ -264,6 +275,7 @@ class AlgorithmConfig:
             use_precomputed_advantage=algorithm_config.get("use_precomputed_advantage", False),
             loss_fn=algorithm_config.get("loss_fn", None),
             lr_schedule=algorithm_config.get("lr_schedule", "constant"),
+            warmup_steps=algorithm_config.get("warmup_steps", None),
             warmup_steps_ratio=algorithm_config.get("warmup_steps_ratio", 0.0),
             kl_beta=algorithm_config.get("kl_beta", 0.0),
             eps_clip=algorithm_config.get("eps_clip", 0.2),

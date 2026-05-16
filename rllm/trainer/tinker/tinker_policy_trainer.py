@@ -424,7 +424,13 @@ Adapted from https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/
 LRSchedule = Literal["linear", "cosine", "constant"]
 
 
-def compute_schedule_lr_multiplier(lr_schedule: LRSchedule, warmup_steps_ratio: float, step: int, total_steps: int) -> float:
+def compute_schedule_lr_multiplier(
+    lr_schedule: LRSchedule,
+    warmup_steps_ratio: float,
+    step: int,
+    total_steps: int,
+    warmup_steps: int | None = None,
+) -> float:
     """
     What factor to multiply the base LR by due to the LR schedule
 
@@ -439,11 +445,11 @@ def compute_schedule_lr_multiplier(lr_schedule: LRSchedule, warmup_steps_ratio: 
     """
     import math
 
-    warmup_steps = int(total_steps * warmup_steps_ratio)
-    if step < warmup_steps:
+    warmup_steps = int(warmup_steps) if warmup_steps is not None else int(total_steps * warmup_steps_ratio)
+    if warmup_steps > 0 and step < warmup_steps:
         return step / warmup_steps
     # Adjust step and total_steps for warmup steps
-    step, total_steps = step - warmup_steps, total_steps - warmup_steps
+    step, total_steps = step - warmup_steps, max(total_steps - warmup_steps, 1)
     if lr_schedule == "linear":
         return 1 - step / total_steps
     elif lr_schedule == "cosine":

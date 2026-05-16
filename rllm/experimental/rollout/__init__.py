@@ -4,12 +4,14 @@ from .rollout_engine import ModelOutput, RolloutEngine
 from .types import TinkerTokenInput, TinkerTokenOutput, TokenInput, Tokenizer, TokenOutput, VerlTokenInput, VerlTokenOutput
 
 if TYPE_CHECKING:
+    from .fireworks_engine import FireworksEngine
     from .tinker_engine import TinkerEngine
     from .verl_engine import VerlEngine
 
 __all__ = [
     "ModelOutput",
     "RolloutEngine",
+    "FireworksEngine",
     "TinkerEngine",
     "VerlEngine",
     # Token types
@@ -35,4 +37,8 @@ def __getattr__(name):
             return _VerlEngine
         except Exception:
             raise AttributeError(name) from None
+    if name == "FireworksEngine":
+        from .fireworks_engine import FireworksEngine as _FireworksEngine
+
+        return _FireworksEngine
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

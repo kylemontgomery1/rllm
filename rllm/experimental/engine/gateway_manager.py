@@ -22,7 +22,7 @@ Modes:
 - 'thread': background thread via ``create_app`` + uvicorn (for tinker /
   single-machine / eval)
 
-For Tinker backends, an in-process handler is injected into the gateway
+For Tinker/Fireworks backends, an in-process handler is injected into the gateway
 (via ``local_handler``), avoiding the need for a separate HTTP backend server.
 """
 
@@ -169,15 +169,15 @@ class GatewayManager:
         """Start the gateway and register inference workers.
 
         For VerlEngine: registers the existing vLLM server addresses.
-        For TinkerEngine: creates an in-process handler (no sidecar needed).
+        For TinkerEngine/FireworksEngine: creates an in-process handler (no sidecar needed).
         """
         engine_cls = type(rollout_engine).__name__
 
-        if engine_cls == "TinkerEngine":
+        if engine_cls in {"TinkerEngine", "FireworksEngine"}:
             # In-process handler — no HTTP backend, no worker registration
-            from rllm.experimental.engine.tinker_adapter import create_tinker_handler
+            from rllm.experimental.engine.tinker_adapter import create_rollout_handler
 
-            self._local_handler = create_tinker_handler(rollout_engine)
+            self._local_handler = create_rollout_handler(rollout_engine)
             self._start_thread(local_handler=self._local_handler)
         elif engine_cls == "VerlEngine":
             if self.mode == "process":

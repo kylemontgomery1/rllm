@@ -70,15 +70,22 @@ algorithm:
   use_rllm: null  # deprecated, unified trainer only support rllm advantage estimators
   use_precomputed_advantage: false # use pre-computed step.advantage from the workflow (e.g. distillation)
   loss_fn: null           # backend-specific values; null = backend default
+  lr_schedule: constant   # [constant, linear, cosine]
+  warmup_steps: null      # Absolute optimizer-step warmup; overrides warmup_steps_ratio when set
+  warmup_steps_ratio: 0.0 # Fractional warmup fallback when warmup_steps is null
   loss_agg_mode: null     # [null, token-mean, seq-mean-token-sum, seq-mean-token-mean]
   kl_beta: 0.0            # KL penalty coefficient
   eps_clip: 0.2           # PPO clip epsilon
   eps_clip_high: null     # Asymmetric upper clip bound (null = symmetric)
-  router_replay: disabled # Router Replay: "disabled" | "R2" (training-side record) | "R3" (rollout-side record)
+  router_replay: disabled # Router Replay: false/"disabled" | true/"R3"
   rollout_correction:
     bypass_mode: null     # true = pi_old = pi_rollout, false = pi_old is computed (null = backend default)
     tis_mode: null        # null = disabled, "token" or "sequence" = TIS importance sampling level
     tis_cap: 2.0          # Upper clamp on TIS importance weight
+    rs_mode: null         # null = disabled; backend-specific rejection-sampling correction mode
+    rs_threshold: null
+    icepop_mode: null     # null = disabled, "token" or "sequence" = hard two-sided IcePop correction
+    icepop_beta: 2.0
 
 # Stepwise advantage
 # TODO(listar2000): deprecate the `per_step` mode and refactor this config.
@@ -107,6 +114,7 @@ compact_filtering:
   mask_timeout: True
   mask_unknown: False
   mask_error: True
+  mask_format_error: False
 
 # Rejection sampling
 rejection_sample:
@@ -159,3 +167,5 @@ async_training:
 episode_logging:
   log_episodes: false
   episode_log_dir: logs/${rllm.trainer.project_name}/${rllm.trainer.experiment_name}
+  log_compact_rollouts: false
+  compact_rollout_dir: logs/${rllm.trainer.project_name}/${rllm.trainer.experiment_name}/compact_rollouts

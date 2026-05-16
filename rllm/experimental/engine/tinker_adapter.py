@@ -1,12 +1,12 @@
-"""Create a local handler from TinkerEngine for the model gateway.
+"""Create local rollout-engine handlers for the model gateway.
 
 The handler is a plain ``async (dict) -> dict`` callable that translates
-OpenAI-format request dicts into ``TinkerEngine.get_model_response()`` calls
+OpenAI-format request dicts into ``RolloutEngine.get_model_response()`` calls
 and returns responses with embedded token IDs and logprobs in the format
 expected by the gateway's ``data_process.py`` extractors.
 
-This replaces the sidecar ``TinkerBackendServer`` with an in-process call,
-eliminating the extra HTTP hop and port allocation.
+This is used by local token-in/token-out engines such as Tinker and Fireworks,
+eliminating an extra HTTP backend hop while preserving gateway trace capture.
 """
 
 import json
@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from rllm.experimental.rollout.tinker_engine import TinkerEngine
+from rllm.experimental.rollout.rollout_engine import RolloutEngine
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,8 @@ def _to_openai_tool_calls(tool_calls: list) -> list[dict[str, Any]]:
     return result
 
 
-def create_tinker_handler(engine: TinkerEngine) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
-    """Return an async handler that calls TinkerEngine in-process.
+def create_rollout_handler(engine: RolloutEngine) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
+    """Return an async handler that calls a rollout engine in-process.
 
     The returned callable accepts an OpenAI chat completion request dict and
     returns an OpenAI chat completion response dict with token extensions
@@ -54,6 +54,8 @@ def create_tinker_handler(engine: TinkerEngine) -> Callable[[dict[str, Any]], Aw
         tools = request_body.get("tools", [])
 
         kwargs: dict[str, Any] = {}
+        if request_body.get("user") is not None:
+            kwargs["application_id"] = request_body["user"]
         if tools:
             kwargs["tools"] = tools
         if request_body.get("temperature") is not None:
@@ -64,8 +66,8 @@ def create_tinker_handler(engine: TinkerEngine) -> Callable[[dict[str, Any]], Aw
             kwargs["top_k"] = request_body["top_k"]
         if request_body.get("max_tokens") is not None:
             kwargs["max_tokens"] = request_body["max_tokens"]
-        if request_body.get("max_completion_tokens") is not None:
-            kwargs["max_completion_tokens"] = request_body["max_completion_tokens"]
+        elif request_body.get("max_completion_tokens") is not None:
+            kwargs["max_tokens"] = request_body["max_completion_tokens"]
 
         model_output = await engine.get_model_response(messages, **kwargs)
 
@@ -111,3 +113,8 @@ def create_tinker_handler(engine: TinkerEngine) -> Callable[[dict[str, Any]], Aw
         }
 
     return handler
+
+
+def create_tinker_handler(engine: RolloutEngine) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
+    """Backward-compatible alias for Tinker gateway setup."""
+    return create_rollout_handler(engine)
