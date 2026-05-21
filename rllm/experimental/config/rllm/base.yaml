@@ -114,7 +114,25 @@ compact_filtering:
   mask_timeout: True
   mask_unknown: False
   mask_error: True
-  mask_format_error: False
+
+# Optional reward shaping before advantage computation.
+reward_shaping:
+  enable: False
+  length_penalty_coef: 0.0
+  length_penalty_free_tokens: 0
+  length_penalty_cap_tokens: 32768
+  include_intermediary_obs_tokens: True
+
+# Optional trajectory filtering after advantage computation, before loss.
+post_advantage_filtering:
+  enable: False
+  mask_max_prompt_length_exceeded: False
+  mask_max_response_length_exceeded: False
+  mask_env_done: False
+  mask_max_turns_exceeded: False
+  mask_timeout: False
+  mask_unknown: False
+  mask_error: False
 
 # Rejection sampling
 rejection_sample:
@@ -133,11 +151,13 @@ remote_runtime:
     agent_runtime_arn: ""
     s3_bucket: ""
     tps_limit: 25
+    max_pool_connections: 10
   harbor:
     agent: mini-swe-agent       # scaffold name (mini-swe-agent | aider | openhands | swe-agent | qwen-coder | ...)
     environment_type: docker    # docker | modal | daytona | e2b | runloop | gke | apple-container
     agent_kwargs: {}            # pass-through to harbor's AgentConfig.kwargs (scaffold-specific flags)
     env_overrides: {}           # pass-through to harbor's EnvironmentConfig (override_cpus, override_memory_mb, override_storage_mb, override_gpus)
+    trials_dir: trials/${rllm.trainer.experiment_name}
     agent_timeout_multiplier: null
     verifier_timeout_multiplier: null
     agent_setup_timeout_multiplier: null

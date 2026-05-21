@@ -23,10 +23,12 @@ from rllm.experimental.common.advantage import (
 from rllm.experimental.common.config import (
     AsyncTrainingConfig,
     CompactFilteringConfig,
+    PostAdvantageFilteringConfig,
     RejectionSamplingConfig,
+    RewardShapingConfig,
     TransformConfig,
 )
-from rllm.experimental.common.metrics import reduce_metrics_lists
+from rllm.experimental.common.metrics import reduce_episode_solve_status_metrics, reduce_metrics_lists
 from rllm.experimental.common.performance import simple_timer
 from rllm.experimental.common.rejection_sampling import (
     RejectionSamplingState,
@@ -256,6 +258,10 @@ class UnifiedTrainer:
         self.backend.validate_config()
 
         self.cf_config = CompactFilteringConfig.from_config(self.rllm_config.compact_filtering)
+        self.post_advantage_filtering_config = PostAdvantageFilteringConfig.from_config(
+            self.rllm_config.get("post_advantage_filtering", {})
+        )
+        self.reward_shaping_config = RewardShapingConfig.from_config(self.rllm_config.get("reward_shaping", {}))
         self.transform_config = TransformConfig.from_config(
             self.rllm_config.get("transform", {}),
             broadcast=self.rllm_config.stepwise_advantage.mode == "broadcast",
@@ -434,6 +440,8 @@ class UnifiedTrainer:
         total_counts = max(sum(termination_counts.values()), 1)
         for r in TerminationReason:
             trainer_state.metrics[f"batch/termination_reason/{r.value}"] = termination_counts[r.value] / total_counts
+        trainer_state.metrics["episode/num_episodes"] = len(trainer_state.episodes)
+        trainer_state.metrics.update(reduce_episode_solve_status_metrics(trainer_state.episodes))
 
         # stage 2: transform episodes to trajectory groups (sync)
         trajectory_groups, transform_metrics = transform_episodes_to_trajectory_groups(trainer_state.episodes, self.transform_config, self.cf_config, traj_grouping_hook=self.traj_grouping_hook)
@@ -500,6 +508,8 @@ class UnifiedTrainer:
             algorithm_config=self.algorithm_config,
             transform_config=self.transform_config,
             cf_config=self.cf_config,
+            post_advantage_filtering_config=self.post_advantage_filtering_config,
+            reward_shaping_config=self.reward_shaping_config,
             rs_config=self.rs_config,
             episode_offload_dir=self.async_config.episode_offload_dir,
             trajectory_group_offload_dir=self.async_config.trajectory_group_offload_dir,
@@ -798,6 +808,7 @@ class UnifiedTrainer:
                 step=trainer_state.global_step,
                 episodes=trainer_state.episodes,
                 trajectory_groups=trainer_state.trajectory_groups,
+                commit=True,
             )
 
             # Periodic validation

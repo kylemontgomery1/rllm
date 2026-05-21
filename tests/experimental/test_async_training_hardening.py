@@ -7,14 +7,18 @@ from rllm.experimental.buffer import TrajectoryGroupBuffer
 from rllm.experimental.common.config import (
     AlgorithmConfig,
     CompactFilteringConfig,
+    PostAdvantageFilteringConfig,
     RejectionSamplingConfig,
+    RewardShapingConfig,
     TransformConfig,
 )
+from rllm.experimental.common.metrics import reduce_episode_solve_status_metrics
+from rllm.experimental.common.reward_shaping import apply_reward_shaping
 from rllm.experimental.common.transform import transform_episodes_to_trajectory_groups
 from rllm.experimental.metrics import MetricsAggregator
 from rllm.experimental.sync_coordinator import SyncCoordinator, SyncCoordinatorConfig
 from rllm.trainer.fireworks.fireworks_backend import FireworksBackend
-from rllm.types import Episode
+from rllm.types import Episode, Step, Trajectory, TrajectoryGroup
 from rllm.workflows.workflow import TerminationReason
 
 
@@ -106,6 +110,8 @@ def test_metrics_aggregator_pools_distribution_statistics():
     aggregator = MetricsAggregator()
     aggregator.record_distribution("reward/search", [0.0, 1.0])
     aggregator.record_distribution("reward/search", [1.0, 1.0, 1.0])
+    aggregator.record("episode/num_episodes", 2, rule="sum")
+    aggregator.record("episode/num_episodes", 3, rule="sum")
 
     metrics = aggregator.flush()
 
@@ -113,6 +119,47 @@ def test_metrics_aggregator_pools_distribution_statistics():
     assert metrics["reward/search/std"] == pytest.approx(0.4)
     assert metrics["reward/search/min"] == 0.0
     assert metrics["reward/search/max"] == 1.0
+    assert metrics["episode/num_episodes"] == 5.0
+
+
+def test_reduce_episode_solve_status_metrics_classifies_prompt_rollout_groups():
+    episodes = [
+        Episode(id="all:0", is_correct=True),
+        Episode(id="all:1", is_correct=True),
+        Episode(id="partial:0", is_correct=True),
+        Episode(id="partial:1", is_correct=False),
+        Episode(id="none:0", is_correct=False),
+        Episode(id="none:1", is_correct=False),
+    ]
+
+    metrics = reduce_episode_solve_status_metrics(episodes)
+
+    assert metrics["episode/solve_all"] == pytest.approx(1 / 3)
+    assert metrics["episode/solve_partial"] == pytest.approx(1 / 3)
+    assert metrics["episode/solve_none"] == pytest.approx(1 / 3)
+
+
+def test_reward_shaping_length_penalty_respects_free_token_threshold():
+    group = TrajectoryGroup(
+        trajectories=[
+            Trajectory(reward=1.0, steps=[Step(response_ids=list(range(length)))])
+            for length in (4, 7, 12)
+        ],
+        group_id="task",
+    )
+    config = RewardShapingConfig(
+        enable=True,
+        length_penalty_coef=0.2,
+        length_penalty_free_tokens=4,
+        length_penalty_cap_tokens=10,
+        include_intermediary_obs_tokens=False,
+    )
+
+    metrics = apply_reward_shaping([group], config)
+
+    assert [traj.info["length_penalty"] for traj in group.trajectories] == pytest.approx([0.0, 0.1, 0.2])
+    assert [traj.reward for traj in group.trajectories] == pytest.approx([1.0, 0.9, 0.8])
+    assert metrics["reward_shaping/penalty/max"] == pytest.approx(0.2)
 
 
 def test_buffer_all_filtered_group_decrements_in_flight_without_queueing_batch():
@@ -133,6 +180,8 @@ def test_buffer_all_filtered_group_decrements_in_flight_without_queueing_batch()
             algorithm_config=AlgorithmConfig(),
             transform_config=TransformConfig(),
             cf_config=CompactFilteringConfig(enable=True, mask_timeout=True),
+            post_advantage_filtering_config=PostAdvantageFilteringConfig(),
+            reward_shaping_config=RewardShapingConfig(),
             rs_config=RejectionSamplingConfig(),
         )
 

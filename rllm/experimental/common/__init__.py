@@ -9,7 +9,9 @@ from rllm.experimental.common.config import (
     AlgorithmConfig,
     AsyncTrainingConfig,
     CompactFilteringConfig,
+    PostAdvantageFilteringConfig,
     RejectionSamplingConfig,
+    RewardShapingConfig,
     RolloutCorrectionConfig,
     TransformConfig,
     rLLMAdvantageEstimator,
@@ -21,6 +23,11 @@ from rllm.experimental.common.rejection_sampling import (
     RejectionSamplingState,
     apply_rejection_sampling_and_filtering,
 )
+from rllm.experimental.common.reward_shaping import (
+    apply_reward_shaping,
+    filter_uniform_base_reward_groups,
+    post_advantage_filter_groups,
+)
 from rllm.experimental.common.transform import transform_episodes_to_trajectory_groups
 from rllm.experimental.common.visualization import VisualizationConfig, colorful_print, colorful_warning, visualize_trajectory_last_steps
 
@@ -28,6 +35,8 @@ __all__ = [
     # Config
     "AsyncTrainingConfig",
     "CompactFilteringConfig",
+    "PostAdvantageFilteringConfig",
+    "RewardShapingConfig",
     "RejectionSamplingConfig",
     "RolloutCorrectionConfig",
     "TransformConfig",
@@ -43,6 +52,9 @@ __all__ = [
     "RejectionSamplingMetrics",
     "RejectionSamplingState",
     "apply_rejection_sampling_and_filtering",
+    "apply_reward_shaping",
+    "filter_uniform_base_reward_groups",
+    "post_advantage_filter_groups",
     # Advantage computation
     "rLLMAdvantageEstimator",
     "collect_reward_and_advantage_from_trajectory_groups",

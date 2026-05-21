@@ -121,7 +121,7 @@ class RemoteAgentFlowEngine:
             result = results[0]
 
             if not result.finished:
-                logger.warning("[%s] Remote task failed (assigning reward=0): %s", uid, result.error)
+                # logger.warning("[%s] Remote task failed (assigning reward=0): %s", uid, result.error)
                 result.reward = 0.0
 
             traces = await self.gateway.aget_traces(session_id)

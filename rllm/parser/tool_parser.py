@@ -1,4 +1,5 @@
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -37,6 +38,9 @@ class ToolParser(ABC):
             if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and "llama" in tokenizer_cls:
                 print(f"Using R1ToolParser for {tokenizer.name_or_path}")
                 return R1ToolParser()
+            elif any(x in model_name for x in ("qwen3.5", "qwen3_5", "qwen35", "qwen3p5", "qwen3.6", "qwen3_6", "qwen36", "qwen3p6")):
+                print(f"Using Qwen3p5ToolParser for {tokenizer.name_or_path}")
+                return Qwen3p5ToolParser()
             elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
                 print(f"Using QwenToolParser for {tokenizer.name_or_path}")
                 return QwenToolParser()
@@ -266,3 +270,82 @@ For each function call, return a json object with function name and arguments wi
 {{"name": <function-name>, "arguments": <args-json-object>}}
 </tool_call>
 """.rstrip()
+
+
+class Qwen3p5ToolParser(QwenToolParser):
+    def parse(self, model_response: str) -> list[ToolCall]:
+        tool_calls_dicts = self.parse_qwen3p5_tool_calls(model_response)
+        return [ToolCall(name=tc["name"], arguments=tc["arguments"]) for tc in tool_calls_dicts]
+
+    def parse_qwen3p5_tool_calls(self, text: str) -> list[dict[str, Any]]:
+        tool_calls: list[dict[str, Any]] = []
+        if self.tool_call_begin not in text:
+            return tool_calls
+
+        call_pattern = re.compile(
+            r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+            flags=re.DOTALL,
+        )
+        parameter_pattern = re.compile(r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", flags=re.DOTALL)
+
+        for call_match in call_pattern.finditer(text):
+            function_name = call_match.group(1).strip()
+            function_body = call_match.group(2)
+            arguments: dict[str, Any] = {}
+
+            for parameter_match in parameter_pattern.finditer(function_body):
+                parameter_name = parameter_match.group(1).strip()
+                parameter_value = parameter_match.group(2).strip()
+                try:
+                    arguments[parameter_name] = json.loads(parameter_value)
+                except json.JSONDecodeError:
+                    arguments[parameter_name] = parameter_value
+
+            tool_calls.append({"name": function_name, "arguments": arguments})
+
+        return tool_calls
+
+    def format_tool_call(self, tool_call: dict[str, Any]) -> str:
+        name = tool_call["name"]
+        arguments = tool_call.get("arguments", {})
+        parameter_strs = []
+        for args_name, args_value in arguments.items():
+            if isinstance(args_value, str):
+                args_value_str = args_value
+            else:
+                args_value_str = json.dumps(args_value)
+            parameter_strs.append(f"<parameter={args_name}>\n{args_value_str}\n</parameter>\n")
+
+        return f"{self.tool_call_begin}\n<function={name}>\n{''.join(parameter_strs)}</function>\n{self.tool_call_end}"
+
+    def get_tool_prompt(self, tools_schema: str) -> str:
+        return f"""# Tools
+
+You have access to the following functions:
+
+<tools>
+{tools_schema}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>"""

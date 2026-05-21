@@ -110,6 +110,9 @@ class ChatTemplateParser:
                 else:
                     logger.info(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
                     return DeepseekQwenChatTemplateParser(tokenizer, disable_thinking=disable_thinking)
+            elif any(x in model_name for x in ("qwen3.5", "qwen3_5", "qwen35", "qwen3p5", "qwen3.6", "qwen3_6", "qwen36", "qwen3p6")):
+                logger.info(f"Using Qwen3p5ChatTemplateParser for {tokenizer.name_or_path}")
+                return Qwen3p5ChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
             elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
                 logger.info(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
                 return QwenChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
@@ -591,6 +594,62 @@ class QwenChatTemplateParser(ChatTemplateParser):
                     processed_image = fetch_image(image_dict, image_patch_size=self.processor.image_processor.patch_size)  # PIL.Image.Image
                     image_data.append(processed_image)
         return image_data
+
+
+class Qwen3p5ChatTemplateParser(QwenChatTemplateParser):
+    def __init__(self, tokenizer, processor=None, disable_thinking=False):
+        super().__init__(tokenizer, processor=processor, disable_thinking=False)
+        self.disable_thinking = disable_thinking
+        self.assistant_token = "<|im_start|>assistant\n"
+        if disable_thinking:
+            self.generation_prompt = self.assistant_token + "<think>\n\n</think>\n\n"
+        else:
+            self.generation_prompt = self.assistant_token + "<think>\n"
+
+        from rllm.parser.tool_parser import Qwen3p5ToolParser
+
+        self.tool_parser = Qwen3p5ToolParser()
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = (message.get("content", None) or "").strip()
+        reasoning = (message.get("reasoning_content", None) or message.get("reasoning", None) or "").strip()
+        tool_calls = message.get("tool_calls", None) or []
+
+        result = self.assistant_token
+        if accumulate_reasoning:
+            result += "<think>\n"
+            if reasoning and not self.disable_thinking:
+                result += reasoning
+            result += "\n</think>\n\n"
+
+        if content:
+            result += content
+
+        if tool_calls:
+            if content:
+                result += "\n\n"
+            tool_call_strs = []
+            for tool_call in tool_calls:
+                if isinstance(tool_call, ToolCall):
+                    tool_call_dict = tool_call.to_dict()
+                elif isinstance(tool_call, dict) and "function" in tool_call:
+                    tool_call_dict = tool_call["function"]
+                else:
+                    tool_call_dict = tool_call
+                arguments_obj = tool_call_dict.get("arguments")
+                if isinstance(arguments_obj, str):
+                    try:
+                        arguments_obj = json.loads(arguments_obj)
+                    except json.JSONDecodeError:
+                        pass
+                tool_call_for_dump = dict(tool_call_dict)
+                if arguments_obj is not None:
+                    tool_call_for_dump["arguments"] = arguments_obj
+                tool_call_strs.append(self.tool_parser.format_tool_call(tool_call_for_dump))
+            result += "\n".join(tool_call_strs)
+
+        result += self.eot_token
+        return result
 
 
 class LlamaChatTemplateParser(ChatTemplateParser):

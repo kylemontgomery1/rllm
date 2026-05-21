@@ -46,14 +46,16 @@ class AgentCoreRuntime(RemoteAgentRuntime):
             s3_bucket=cfg.s3_bucket,
             exp_id=self._exp_id,
             tps_limit=cfg.tps_limit,
+            max_pool_connections=cfg.max_pool_connections,
         )
         logger.info(
-            "AgentCoreRuntime initialized: arn=%s, bucket=%s, exp=%s, model=%s, tps=%d",
+            "AgentCoreRuntime initialized: arn=%s, bucket=%s, exp=%s, model=%s, tps=%d, max_pool_connections=%d",
             cfg.agent_runtime_arn,
             cfg.s3_bucket,
             self._exp_id,
             self._model_id,
             cfg.tps_limit,
+            cfg.max_pool_connections,
         )
 
     async def _run_one(self, sub: TaskSubmission, timeout: float) -> RemoteTaskResult:

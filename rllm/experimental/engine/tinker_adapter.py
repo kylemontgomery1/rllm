@@ -21,6 +21,34 @@ from rllm.experimental.rollout.rollout_engine import RolloutEngine
 logger = logging.getLogger(__name__)
 
 
+def _content_to_text(content: Any) -> str:
+    """Normalize OpenAI content blocks for rollout engines that expect text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [_content_to_text(part) for part in content]
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        for key in ("text", "content"):
+            value = content.get(key)
+            if value is not None:
+                return _content_to_text(value)
+        return json.dumps(content)
+    return str(content)
+
+
+def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = []
+    for message in messages:
+        item = dict(message)
+        if "content" in item:
+            item["content"] = _content_to_text(item["content"])
+        normalized.append(item)
+    return normalized
+
+
 def _to_openai_tool_calls(tool_calls: list) -> list[dict[str, Any]]:
     """Convert rLLM ToolCall objects to OpenAI-format tool_calls."""
     result = []
@@ -50,7 +78,7 @@ def create_rollout_handler(engine: RolloutEngine) -> Callable[[dict[str, Any]], 
     """
 
     async def handler(request_body: dict[str, Any]) -> dict[str, Any]:
-        messages = request_body.get("messages", [])
+        messages = _normalize_messages(request_body.get("messages", []))
         tools = request_body.get("tools", [])
 
         kwargs: dict[str, Any] = {}
@@ -71,7 +99,7 @@ def create_rollout_handler(engine: RolloutEngine) -> Callable[[dict[str, Any]], 
 
         model_output = await engine.get_model_response(messages, **kwargs)
 
-        response_text = model_output.content or model_output.text or ""
+        response_text = model_output.content or ""
         prompt_ids = list(model_output.prompt_ids) if model_output.prompt_ids else []
         completion_ids = list(model_output.completion_ids) if model_output.completion_ids else []
         logprobs = model_output.logprobs or []
@@ -124,6 +152,7 @@ def create_rollout_handler(engine: RolloutEngine) -> Callable[[dict[str, Any]], 
                 "total_tokens": prompt_len + completion_len,
             },
             "prompt_token_ids": prompt_ids,
+            "weight_version": getattr(model_output, "weight_version", None),
         }
 
     return handler

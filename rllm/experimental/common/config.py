@@ -65,7 +65,6 @@ class CompactFilteringConfig:
     mask_timeout: bool = False
     mask_unknown: bool = False
     mask_error: bool = False
-    mask_format_error: bool = False
 
     @classmethod
     def from_config(cls, config: DictConfig) -> "CompactFilteringConfig":
@@ -96,8 +95,66 @@ class CompactFilteringConfig:
             or (self.mask_timeout and termination_reason == TerminationReason.TIMEOUT)
             or (self.mask_unknown and termination_reason == TerminationReason.UNKNOWN)
             or (self.mask_error and termination_reason == TerminationReason.ERROR)
-            or (self.mask_format_error and termination_reason == TerminationReason.FORMAT_ERROR)
         )
+
+
+@dataclass
+class PostAdvantageFilteringConfig:
+    """Configuration for dropping trajectories after advantage computation.
+
+    This is intentionally separate from compact filtering: compact filtering
+    controls which episodes can influence rewards/advantages, while this
+    controls which trajectories contribute loss tokens.
+    """
+
+    enable: bool = False
+    mask_max_prompt_length_exceeded: bool = False
+    mask_max_response_length_exceeded: bool = False
+    mask_env_done: bool = False
+    mask_max_turns_exceeded: bool = False
+    mask_timeout: bool = False
+    mask_unknown: bool = False
+    mask_error: bool = False
+
+    @classmethod
+    def from_config(cls, config: DictConfig) -> "PostAdvantageFilteringConfig":
+        if config is None:
+            values = {}
+        else:
+            values = OmegaConf.to_container(config) if OmegaConf.is_config(config) else dict(config)
+        return cls(**values)  # type: ignore
+
+    def should_mask(self, termination_reason: TerminationReason) -> bool:
+        if not self.enable:
+            return False
+        return (
+            (self.mask_max_prompt_length_exceeded and termination_reason == TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
+            or (self.mask_max_response_length_exceeded and termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED)
+            or (self.mask_env_done and termination_reason == TerminationReason.ENV_DONE)
+            or (self.mask_max_turns_exceeded and termination_reason == TerminationReason.MAX_TURNS_EXCEEDED)
+            or (self.mask_timeout and termination_reason == TerminationReason.TIMEOUT)
+            or (self.mask_unknown and termination_reason == TerminationReason.UNKNOWN)
+            or (self.mask_error and termination_reason == TerminationReason.ERROR)
+        )
+
+
+@dataclass
+class RewardShapingConfig:
+    """Optional trajectory-level reward shaping."""
+
+    enable: bool = False
+    length_penalty_coef: float = 0.0
+    length_penalty_free_tokens: int = 0
+    length_penalty_cap_tokens: int = 32768
+    include_intermediary_obs_tokens: bool = True
+
+    @classmethod
+    def from_config(cls, config: DictConfig) -> "RewardShapingConfig":
+        if config is None:
+            values = {}
+        else:
+            values = OmegaConf.to_container(config) if OmegaConf.is_config(config) else dict(config)
+        return cls(**values)  # type: ignore
 
 
 @dataclass

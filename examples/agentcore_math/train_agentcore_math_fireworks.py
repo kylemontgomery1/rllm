@@ -1,4 +1,4 @@
-"""Train a math agent on GSM8K using Tinker backend + AgentCore remote runtime.
+"""Train a math agent on GSM8K using Fireworks backend + AgentCore runtime.
 
 The agent runs inside an AgentCore container (strands_math_agent) and calls back
 to the rllm-model-gateway for model inference. The gateway captures all traces
@@ -9,7 +9,7 @@ Usage:
     python -m examples.agentcore_math.prepare_gsm8k_data
 
     # Then train:
-    bash examples/agentcore_math/train_agentcore_math_tinker.sh
+    bash examples/agentcore_math/train_agentcore_math_fireworks_async.sh
 """
 
 import logging
@@ -37,7 +37,7 @@ def main(config):
     test_dataset = DatasetRegistry.load_dataset("gsm8k_agentcore", "test")
 
     trainer = AgentTrainer(
-        backend="tinker",
+        backend="fireworks",
         config=config,
         train_dataset=train_dataset,
         val_dataset=test_dataset,

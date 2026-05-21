@@ -37,11 +37,13 @@ def create_remote_runtime(
         from rllm.integrations.harbor.runtime import HarborRuntime
 
         h = HarborRuntimeConfig(**config.harbor)
+        trials_dir = h.trials_dir or (f"trials/{exp_id}" if exp_id else None)
         return HarborRuntime(
             agent_name=h.agent,
             environment_type=h.environment_type,
             agent_kwargs=dict(h.agent_kwargs),
             env_overrides=dict(h.env_overrides),
+            trials_dir=trials_dir,
             agent_timeout_multiplier=h.agent_timeout_multiplier,
             verifier_timeout_multiplier=h.verifier_timeout_multiplier,
             agent_setup_timeout_multiplier=h.agent_setup_timeout_multiplier,

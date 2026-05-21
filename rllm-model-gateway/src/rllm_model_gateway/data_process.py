@@ -79,6 +79,22 @@ def extract_routing_matrices(response: dict[str, Any]) -> list[str]:
     ]
 
 
+def extract_weight_version(response: dict[str, Any]) -> int | None:
+    """Extract rollout policy version from gateway-private response fields."""
+    version = response.get("weight_version")
+    if version is None:
+        choices = response.get("choices") or []
+        if choices:
+            version = choices[0].get("weight_version")
+    if version is None:
+        return None
+    try:
+        return int(version)
+    except (TypeError, ValueError):
+        logger.debug("Ignoring invalid weight_version in response: %r", version)
+        return None
+
+
 # ------------------------------------------------------------------
 # Streaming accumulation helpers
 # ------------------------------------------------------------------
@@ -128,6 +144,7 @@ _VLLM_ROOT_FIELDS = frozenset(
         "prompt_token_ids",
         "prompt_logprobs",
         "kv_transfer_params",
+        "weight_version",
     }
 )
 
@@ -211,6 +228,7 @@ def build_trace_record(
         logprobs=extract_logprobs(response_body) or None,
         routing_matrices=extract_routing_matrices(response_body) or None,
         finish_reason=first_choice.get("finish_reason"),
+        weight_version=extract_weight_version(response_body),
         latency_ms=latency_ms,
         token_counts=token_counts,
         timestamp=time.time(),
@@ -243,6 +261,7 @@ def build_trace_record_from_chunks(
     content_parts: list[str] = []
     tool_calls_parts: list[dict[str, Any]] = []
     finish_reason: str | None = None
+    weight_version: int | None = None
     model = request_body.get("model", "")
     usage: dict[str, Any] = {}
 
@@ -250,6 +269,9 @@ def build_trace_record_from_chunks(
         if i == 0:
             prompt_ids = extract_prompt_token_ids_from_chunk(chunk)
             model = chunk.get("model", model)
+
+        if weight_version is None:
+            weight_version = extract_weight_version(chunk)
 
         delta_ids = extract_delta_token_ids(chunk)
         completion_ids.extend(delta_ids)
@@ -300,6 +322,7 @@ def build_trace_record_from_chunks(
         logprobs=logprobs or None,
         routing_matrices=routing_matrices or None,
         finish_reason=finish_reason,
+        weight_version=weight_version,
         latency_ms=latency_ms,
         token_counts=token_counts,
         timestamp=time.time(),

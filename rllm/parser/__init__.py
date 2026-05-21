@@ -1,12 +1,14 @@
-from rllm.parser.tool_parser import QwenToolParser, R1ToolParser, ToolParser
+from rllm.parser.tool_parser import Qwen3p5ToolParser, QwenToolParser, R1ToolParser, ToolParser
 
 __all__ = [
     "ChatTemplateParser",
     "DeepseekQwenChatTemplateParser",
+    "Qwen3p5ChatTemplateParser",
     "QwenChatTemplateParser",
     "LlamaChatTemplateParser",
     "ToolParser",
     "R1ToolParser",
+    "Qwen3p5ToolParser",
     "QwenToolParser",
 ]
 
@@ -16,6 +18,7 @@ def __getattr__(name):
         "ChatTemplateParser",
         "DeepseekQwenChatTemplateParser",
         "LlamaChatTemplateParser",
+        "Qwen3p5ChatTemplateParser",
         "QwenChatTemplateParser",
     }
     if name in _chat_template_classes:
@@ -29,6 +32,8 @@ def __getattr__(name):
 PARSER_REGISTRY = {
     "r1": R1ToolParser,
     "qwen": QwenToolParser,
+    "qwen3p5": Qwen3p5ToolParser,
+    "qwen3p6": Qwen3p5ToolParser,
 }
 
 

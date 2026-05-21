@@ -112,6 +112,7 @@ def build_harbor_trial_config(
     environment_type: str | None = None,
     agent_kwargs: dict[str, Any] | None = None,
     env_overrides: dict[str, Any] | None = None,
+    trials_dir: str | None = None,
     agent_timeout_multiplier: float | None = None,
     verifier_timeout_multiplier: float | None = None,
     agent_setup_timeout_multiplier: float | None = None,
@@ -133,6 +134,7 @@ def build_harbor_trial_config(
         environment_type: Harbor environment backend (e.g., "docker", "daytona").
             None uses the task's default.
         agent_kwargs: Extra kwargs passed through to the Harbor agent scaffold.
+        trials_dir: Host directory where Harbor writes per-trial logs/artifacts.
         agent_timeout_multiplier: Multiply agent timeout by this factor.
         verifier_timeout_multiplier: Multiply verifier timeout by this factor.
         agent_setup_timeout_multiplier: Multiply agent setup timeout.
@@ -187,6 +189,8 @@ def build_harbor_trial_config(
     trial_config_kwargs = {}
     if "HARBOR_TRIALS_DIR" in os.environ:
         trial_config_kwargs["trials_dir"] = Path(os.environ["HARBOR_TRIALS_DIR"])
+    elif trials_dir:
+        trial_config_kwargs["trials_dir"] = Path(trials_dir)
 
     return TrialConfig(
         task=TaskConfig(path=Path(task_path)),
@@ -283,12 +287,16 @@ def map_termination_reason(
     """
     from rllm.workflows.workflow import TerminationReason
 
-    if finished:
-        return TerminationReason.ENV_DONE
     if timed_out:
         return TerminationReason.TIMEOUT
     if exception_type:
-        return _get_exception_type_map().get(exception_type, TerminationReason.ERROR)
+        mapped = _get_exception_type_map().get(exception_type)
+        if mapped is not None:
+            return mapped
+    if finished:
+        return TerminationReason.ENV_DONE
+    if exception_type:
+        return TerminationReason.ERROR
     return TerminationReason.ERROR
 
 
@@ -322,6 +330,7 @@ async def run_harbor_task(
     environment_type: str | None = None,
     agent_kwargs: dict[str, Any] | None = None,
     env_overrides: dict[str, Any] | None = None,
+    trials_dir: str | None = None,
     agent_timeout_multiplier: float | None = None,
     verifier_timeout_multiplier: float | None = None,
     agent_setup_timeout_multiplier: float | None = None,
@@ -342,6 +351,7 @@ async def run_harbor_task(
         inference_url: Base URL for LLM API calls.
         environment_type: Harbor environment backend.
         agent_kwargs: Extra kwargs for the Harbor agent scaffold.
+        trials_dir: Host directory where Harbor writes per-trial logs/artifacts.
         agent_timeout_multiplier: Multiply agent timeout.
         verifier_timeout_multiplier: Multiply verifier timeout.
         agent_setup_timeout_multiplier: Multiply agent setup timeout.
@@ -364,6 +374,7 @@ async def run_harbor_task(
             environment_type=environment_type,
             agent_kwargs=agent_kwargs,
             env_overrides=env_overrides,
+            trials_dir=trials_dir,
             agent_timeout_multiplier=agent_timeout_multiplier,
             verifier_timeout_multiplier=verifier_timeout_multiplier,
             agent_setup_timeout_multiplier=agent_setup_timeout_multiplier,

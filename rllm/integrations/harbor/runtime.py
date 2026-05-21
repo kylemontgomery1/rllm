@@ -44,6 +44,7 @@ class HarborRuntime:
         environment_type: str | None = None,
         agent_kwargs: dict[str, Any] | None = None,
         env_overrides: dict[str, Any] | None = None,
+        trials_dir: str | None = None,
         # Training-specific config (ignored by eval path).
         agent_timeout_multiplier: float | None = None,
         verifier_timeout_multiplier: float | None = None,
@@ -55,6 +56,7 @@ class HarborRuntime:
         self.environment_type = environment_type
         self.agent_kwargs = agent_kwargs or {}
         self.env_overrides = env_overrides or {}
+        self.trials_dir = trials_dir
         self.agent_timeout_multiplier = agent_timeout_multiplier
         self.verifier_timeout_multiplier = verifier_timeout_multiplier
         self.agent_setup_timeout_multiplier = agent_setup_timeout_multiplier
@@ -103,6 +105,7 @@ class HarborRuntime:
             environment_type=self.environment_type,
             agent_kwargs=self.agent_kwargs,
             env_overrides=self.env_overrides,
+            trials_dir=self.trials_dir,
             agent_timeout_multiplier=self.agent_timeout_multiplier,
             verifier_timeout_multiplier=self.verifier_timeout_multiplier,
             agent_setup_timeout_multiplier=self.agent_setup_timeout_multiplier,

@@ -21,11 +21,17 @@ if TYPE_CHECKING:
 from rllm.experimental.common import (
     AlgorithmConfig,
     CompactFilteringConfig,
+    PostAdvantageFilteringConfig,
     RejectionSamplingConfig,
+    RewardShapingConfig,
+    apply_reward_shaping,
     TransformConfig,
     collect_reward_and_advantage_from_trajectory_groups,
+    filter_uniform_base_reward_groups,
+    post_advantage_filter_groups,
 )
 from rllm.experimental.common.transform import transform_episodes_to_trajectory_groups
+from rllm.experimental.common.metrics import reduce_episode_solve_status_metrics
 from rllm.experimental.metrics import MetricsAggregator
 from rllm.experimental.sync_coordinator import SyncCoordinator
 from rllm.types import Episode, TrajectoryGroup
@@ -49,9 +55,12 @@ class TrajectoryGroupBuffer:
     1. Record episode-level metrics to aggregator (before any filtering)
     2. Transform episodes -> trajectory groups
     3. Compact filtering + drop groups with < min_trajs_per_group
-    4. Compute advantages
-    5. If rejection sampling enabled: drop groups with all-zero advantage
-    6. Queue the task batch for training
+    4. If rejection sampling enabled: drop verifier-reward-uniform groups
+    5. Apply optional reward shaping
+    6. Compute advantages
+    7. If rejection sampling enabled: drop groups with all-zero advantage
+    8. Apply optional post-advantage filtering before loss
+    9. Queue the task batch for training
 
     Filtered groups are reported directly to the coordinator (which tracks
     throttle slots and filter counts). Only non-empty task batches are queued.
@@ -69,6 +78,8 @@ class TrajectoryGroupBuffer:
         algorithm_config: AlgorithmConfig,
         transform_config: TransformConfig,
         cf_config: CompactFilteringConfig,
+        post_advantage_filtering_config: PostAdvantageFilteringConfig,
+        reward_shaping_config: RewardShapingConfig,
         rs_config: RejectionSamplingConfig,
         episode_offload_dir: str | None = None,
         trajectory_group_offload_dir: str | None = None,
@@ -80,6 +91,8 @@ class TrajectoryGroupBuffer:
         self._algorithm_config = algorithm_config
         self._transform_config = transform_config
         self._cf_config = cf_config
+        self._post_advantage_filtering_config = post_advantage_filtering_config
+        self._reward_shaping_config = reward_shaping_config
         self._rs_config = rs_config
         self._pbar = pbar
 
@@ -224,14 +237,40 @@ class TrajectoryGroupBuffer:
             self._record_classified_prompt_group()
             return True
 
-        # 4. Compute advantages
+        # 4. Filter uniform verifier-reward groups before shaping. This keeps
+        # rejection sampling focused on correctness signal instead of length
+        # differences introduced by reward shaping.
+        filtered_uniform_base = 0
+        if self._rs_config.filter_uniform_groups:
+            before_uniform_base = len(traj_groups)
+            traj_groups, filtered_uniform_base = filter_uniform_base_reward_groups(traj_groups)
+            self._aggregator.record("groups/dropped_uniform_base_reward", filtered_uniform_base, rule="sum")
+            if not traj_groups:
+                self._log_prompt_group_finished(
+                    task_id=task_id,
+                    episodes=episodes,
+                    status="filtered",
+                    reason="uniform_reward",
+                    groups_after_transform=before_min_traj,
+                    groups_after_min_trajs=before_uniform_base,
+                    groups_after_reward_filter=0,
+                )
+                self._coordinator.on_group_filtered()
+                self._filtered_count += 1
+                self._record_classified_prompt_group()
+                return True
+
+        # 5. Apply optional trajectory-level reward shaping before advantages.
+        self._aggregator.record_dict(apply_reward_shaping(traj_groups, self._reward_shaping_config))
+
+        # 6. Compute advantages
         collect_reward_and_advantage_from_trajectory_groups(
             traj_groups,
             self._algorithm_config,
         )
         self._record_reward_and_advantage_metrics(traj_groups)
 
-        # 5. Rejection sampling: drop groups with all-zero advantage
+        # 7. Rejection sampling: drop groups with all-zero advantage
         filtered_zero_adv = 0
         if self._rs_config.filter_uniform_groups:
             before_adv = len(traj_groups)
@@ -254,7 +293,34 @@ class TrajectoryGroupBuffer:
             self._record_classified_prompt_group()
             return True
 
-        # 6. Set weight version and queue
+        # 8. Drop loss-ineligible trajectories after they have influenced
+        # advantages. For this SWE run, max_prompt_length_exceeded can carry
+        # verifier signal but should not contribute loss tokens.
+        before_post_filter = len(traj_groups)
+        traj_groups, post_filter_metrics = post_advantage_filter_groups(
+            traj_groups,
+            self._post_advantage_filtering_config,
+        )
+        for key, value in post_filter_metrics.items():
+            rule = "sum" if key.startswith("post_advantage_filter/dropped_") else None
+            self._aggregator.record(key, value, rule=rule)
+
+        if not traj_groups:
+            self._log_prompt_group_finished(
+                task_id=task_id,
+                episodes=episodes,
+                status="filtered",
+                reason="post_advantage_filtering",
+                groups_after_transform=before_min_traj,
+                groups_after_min_trajs=before_post_filter,
+                groups_after_reward_filter=0,
+            )
+            self._coordinator.on_group_filtered()
+            self._filtered_count += 1
+            self._record_classified_prompt_group()
+            return True
+
+        # 9. Set weight version and queue
         for g in traj_groups:
             g.weight_version = weight_version
 
@@ -334,6 +400,9 @@ class TrajectoryGroupBuffer:
 
     def _record_episode_metrics(self, episodes: list[Episode]) -> None:
         """Record episode-level metrics to aggregator (all episodes, including filtered)."""
+        self._aggregator.record("episode/num_episodes", len(episodes), rule="sum")
+        self._aggregator.record_dict(reduce_episode_solve_status_metrics(episodes))
+
         for ep in episodes:
             reason = ep.termination_reason or TerminationReason.UNKNOWN
             for r in TerminationReason:

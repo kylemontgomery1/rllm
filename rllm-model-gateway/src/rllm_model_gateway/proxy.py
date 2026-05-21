@@ -148,8 +148,23 @@ class ReverseProxy:
 
         if self.local_handler is not None:
             # In-process path: call handler directly, no HTTP
-            response_body = await self.local_handler(request_body)
-            status_code = 200
+            try:
+                response_body = await self.local_handler(request_body)
+                status_code = 200
+            except Exception as exc:
+                reason = getattr(exc, "reason", None)
+                if reason is None:
+                    raise
+                code = getattr(reason, "value", str(reason))
+                logger.debug("Local inference handler rejected request: %s", code)
+                response_body = {
+                    "error": {
+                        "message": str(exc),
+                        "type": exc.__class__.__name__,
+                        "code": code,
+                    }
+                }
+                status_code = 400
         else:
             # HTTP proxy path
             worker = self.router.route(session_id)
@@ -176,7 +191,7 @@ class ReverseProxy:
         latency_ms = (time.perf_counter() - t0) * 1000
 
         # Persist trace
-        if session_id and response_body:
+        if session_id and response_body and "choices" in response_body:
             trace = build_trace_record(session_id, request_body, response_body, latency_ms)
             await self._persist(trace)
 

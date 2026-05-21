@@ -173,7 +173,11 @@ def load_harbor_dataset(identifier: str) -> list[dict]:
     """
     path = Path(identifier)
 
-    # Check if it's a local dataset directory
+    # Check if it's a local dataset directory. Absolute paths should never
+    # fall through to registry lookup; if they are wrong, report the bad path.
+    if path.is_absolute() and not path.exists():
+        raise FileNotFoundError(f"Harbor dataset path does not exist: {path}")
+
     if path.is_absolute() and path.exists():
         if (path / "dataset.toml").exists():
             return load_harbor_dataset_from_local(path)

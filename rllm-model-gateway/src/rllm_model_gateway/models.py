@@ -21,6 +21,7 @@ class TraceRecord(BaseModel):
     logprobs: list[float] | None = None
     routing_matrices: list[str] | None = None
     finish_reason: str | None = None
+    weight_version: int | None = None
     # Metadata
     latency_ms: float = 0.0
     token_counts: dict[str, int] = Field(default_factory=dict)

@@ -74,6 +74,7 @@ class AgentCoreRuntimeConfig:
     agent_runtime_arn: str = ""
     s3_bucket: str = ""
     tps_limit: int = 25
+    max_pool_connections: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,8 @@ class HarborRuntimeConfig:
     # Pass-through to harbor EnvironmentConfig overrides: override_cpus, override_memory_mb,
     # override_storage_mb, override_gpus. Force a resource value regardless of task.toml.
     env_overrides: dict[str, Any] = field(default_factory=dict)
+    # Host directory where Harbor writes per-trial logs/artifacts.
+    trials_dir: str | None = None
     # Per-stage timeout multipliers — None means use the task's default (multiplier 1.0).
     agent_timeout_multiplier: float | None = None
     verifier_timeout_multiplier: float | None = None
